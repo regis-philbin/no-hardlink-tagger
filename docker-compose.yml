@@ -6,12 +6,9 @@ services:
     container_name: no-hardlink-tagger
     restart: unless-stopped
     environment:
-      # --- qBittorrent Credentials ---
       - QBITTORRENT_URL=${QBITTORRENT_URL}
       - QBITTORRENT_USER=${QBITTORRENT_USER}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS}
-      
-      # --- Script Configuration ---
       - ORPHAN_TAG=${ORPHAN_TAG}
       - DOWNLOADS_DIR=${DOWNLOADS_DIR}
       - MEDIA_DIRS=${MEDIA_DIRS}
