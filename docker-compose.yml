@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  qbit-cleanup:
+  no-hardlink-tagger:
     build: .
-    container_name: qbit-cleanup
+    container_name: no-hardlink-tagger
     restart: unless-stopped
     environment:
       - QBITTORRENT_URL=http://your_qbittorrent_ip:port
