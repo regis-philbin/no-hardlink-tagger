@@ -7,12 +7,12 @@ services:
     restart: unless-stopped
     environment:
       # --- qBittorrent Credentials ---
-      - QBITTORRENT_URL=http://192.168.0.66:8080
-      - QBITTORRENT_USER=admin
-      - QBITTORRENT_PASS=qbitpass123
+      - QBITTORRENT_URL=http://your_qbittorrent_ip:port
+      - QBITTORRENT_USER=your_username
+      - QBITTORRENT_PASS=your_password
       
       # --- Script Configuration ---
-      - ORPHAN_TAG=NoMediaLink
+      - ORPHAN_TAG=orphaned
       - DOWNLOADS_DIR=/media/downloads
       - MEDIA_DIRS=/media/movies,/media/tv
     volumes:
