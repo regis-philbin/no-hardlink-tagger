@@ -7,14 +7,14 @@ services:
     restart: unless-stopped
     environment:
       # --- qBittorrent Credentials ---
-      - QBITTORRENT_URL=http://your_qbittorrent_ip:port
-      - QBITTORRENT_USER=your_username
-      - QBITTORRENT_PASS=your_password
+      - QBITTORRENT_URL=${QBITTORRENT_URL}
+      - QBITTORRENT_USER=${QBITTORRENT_USER}
+      - QBITTORRENT_PASS=${QBITTORRENT_PASS}
       
       # --- Script Configuration ---
-      - ORPHAN_TAG=orphaned
-      - DOWNLOADS_DIR=/media/downloads
-      - MEDIA_DIRS=/media/movies,/media/tv
+      - ORPHAN_TAG=${ORPHAN_TAG}
+      - DOWNLOADS_DIR=${DOWNLOADS_DIR}
+      - MEDIA_DIRS=${MEDIA_DIRS}
     volumes:
       # Mount all the relevant directories
       - /media:/media
