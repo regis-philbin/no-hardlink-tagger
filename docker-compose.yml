@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  qbit-cleanup:
+    build: .
+    container_name: qbit-cleanup
+    restart: unless-stopped
+    environment:
+      - QBITTORRENT_URL=http://your_qbittorrent_ip:port
+      - QBITTORRENT_USER=your_username
+      - QBITTORRENT_PASS=your_password
+      - ORPHAN_TAG=orphaned
+    volumes:
+      # Mount all the relevant directories
+      - /path/to/your/downloads:/media/downloads
+      - /path/to/your/media/tv:/media/tv
+      - /path/to/your/media/movies:/media/movies
