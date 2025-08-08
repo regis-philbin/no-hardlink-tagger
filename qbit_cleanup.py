@@ -1,20 +1,20 @@
 import os
 import time
-import configparser
 from qbittorrent import Client
 
 # --- Configuration ---
-config = configparser.ConfigParser()
-config.read('config.ini')
+QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL')
+QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
+QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
-QBITTORRENT_URL = config['qBittorrent']['url']
-QBITTORRENT_USER = config['qBittorrent']['user']
-QBITTORRENT_PASS = config['qBittorrent']['password']
+# Tag to be applied to orphaned torrents
+ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
 
-ORPHAN_TAG = config['script']['orphan_tag']
+# The directory where all your torrents are downloaded
+DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 
-DOWNLOADS_DIR = config['paths']['downloads_dir']
-MEDIA_DIRS = [d.strip() for d in config['paths']['media_dirs'].split(',')]
+# The directories where your final media files are stored
+MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies, /media/tv').split(',')]
 
 # --- Script Logic (rest remains the same) ---
 def get_qb_client():
