@@ -3,9 +3,10 @@ import time
 from qbittorrent import Client
 
 # --- Configuration ---
-QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL')
-QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
-QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
+# The script will now expect these environment variables to be set.
+QBITTORRENT_URL = os.environ['QBITTORRENT_URL']
+QBITTORRENT_USER = os.environ['QBITTORRENT_USER']
+QBITTORRENT_PASS = os.environ['QBITTORRENT_PASS']
 
 # Tag to be applied to orphaned torrents
 ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
@@ -14,7 +15,7 @@ ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 
 # The directories where your final media files are stored
-MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies, /media/tv').split(',')]
+MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
 # --- Script Logic (rest remains the same) ---
 def get_qb_client():
