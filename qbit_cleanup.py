@@ -7,13 +7,10 @@ QBITTORRENT_URL = os.environ['QBITTORRENT_URL']
 QBITTORRENT_USER = os.environ['QBITTORRENT_USER']
 QBITTORRENT_PASS = os.environ['QBITTORRENT_PASS']
 
-# Tag to be applied to orphaned torrents
 ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
 
-# The directory where all your torrents are downloaded
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 
-# The directories where your final media files are stored
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
 # --- Script Logic ---
@@ -46,16 +43,16 @@ def run_cleanup():
     if not qb:
         return
 
-    # Updated method name
+    # Corrected method call: qb.torrents_info()
     torrents = qb.torrents_info()
     orphaned_hashes = []
 
     for torrent in torrents:
         # We only care about torrents in the downloads directory
-        if not torrent.save_path.startswith(DOWNLOADS_DIR):
+        if not torrent['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
-        # Updated method call with torrent hash
+        # Corrected method call: qb.get_torrent_files() requires a hash
         torrent_files = qb.get_torrent_files(torrent['hash'])
         
         is_linked_to_media = False
