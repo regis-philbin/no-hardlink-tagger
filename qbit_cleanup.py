@@ -3,7 +3,6 @@ import time
 from qbittorrent import Client
 
 # --- Configuration ---
-# The script will now expect these environment variables to be set.
 QBITTORRENT_URL = os.environ['QBITTORRENT_URL']
 QBITTORRENT_USER = os.environ['QBITTORRENT_USER']
 QBITTORRENT_PASS = os.environ['QBITTORRENT_PASS']
@@ -17,7 +16,7 @@ DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 # The directories where your final media files are stored
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
-# --- Script Logic (rest remains the same) ---
+# --- Script Logic ---
 def get_qb_client():
     """Connects to the qBittorrent client."""
     try:
@@ -47,6 +46,7 @@ def run_cleanup():
     if not qb:
         return
 
+    # Updated method name
     torrents = qb.torrents_info()
     orphaned_hashes = []
 
@@ -55,11 +55,12 @@ def run_cleanup():
         if not torrent.save_path.startswith(DOWNLOADS_DIR):
             continue
 
-        torrent_files = qb.get_torrent_files(torrent.hash)
+        # Updated method call with torrent hash
+        torrent_files = qb.get_torrent_files(torrent['hash'])
         
         is_linked_to_media = False
         for file_info in torrent_files:
-            torrent_file_path = os.path.join(torrent.save_path, file_info.name)
+            torrent_file_path = os.path.join(torrent['save_path'], file_info['name'])
 
             # Find the corresponding media file by name search
             media_file_path = find_media_path(torrent_file_path)
@@ -78,10 +79,10 @@ def run_cleanup():
                 pass
 
         if not is_linked_to_media:
-            print(f"Torrent '{torrent.name}' is not linked to a media file. Tagging as '{ORPHAN_TAG}'.")
-            orphaned_hashes.append(torrent.hash)
+            print(f"Torrent '{torrent['name']}' is not linked to a media file. Tagging as '{ORPHAN_TAG}'.")
+            orphaned_hashes.append(torrent['hash'])
         else:
-            print(f"Torrent '{torrent.name}' is linked to media. No action needed.")
+            print(f"Torrent '{torrent['name']}' is linked to media. No action needed.")
 
     if orphaned_hashes:
         print(f"Tagging {len(orphaned_hashes)} torrents with '{ORPHAN_TAG}'...")
