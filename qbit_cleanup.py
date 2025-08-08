@@ -3,12 +3,10 @@ import time
 from qbittorrent import Client
 
 # --- Configuration ---
-# Use .get() to prevent crashes and provide a clear error message
 QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
-# Check if required variables are set before proceeding
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     print("Error: Missing one or more required qBittorrent environment variables.")
     print("Please check QBITTORRENT_URL, QBITTORRENT_USER, and QBITTORRENT_PASS.")
@@ -18,9 +16,7 @@ ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
-# --- Script Logic ---
 def get_qb_client():
-    """Connects to the qBittorrent client."""
     try:
         qb = Client(QBITTORRENT_URL)
         qb.login(QBITTORRENT_USER, QBITTORRENT_PASS)
@@ -30,10 +26,6 @@ def get_qb_client():
         return None
 
 def find_media_path(torrent_file_path):
-    """
-    Finds the corresponding media path for a torrent file by searching for the
-    file name within the media directories.
-    """
     torrent_filename = os.path.basename(torrent_file_path)
     for media_dir in MEDIA_DIRS:
         for root, dirs, files in os.walk(media_dir):
@@ -42,13 +34,11 @@ def find_media_path(torrent_file_path):
     return None
 
 def run_cleanup():
-    """Main function to perform the cleanup."""
     print("Starting qBittorrent cleanup script...")
     qb = get_qb_client()
     if not qb:
         return
 
-    # Correct method call: qb.torrents()
     try:
         torrents = qb.torrents()
     except Exception as e:
@@ -58,18 +48,14 @@ def run_cleanup():
     orphaned_hashes = []
 
     for torrent in torrents:
-        # We only care about torrents in the downloads directory
         if not torrent['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
-        # Correct method call: qb.get_torrent_files() requires a hash
         torrent_files = qb.get_torrent_files(torrent['hash'])
         
         is_linked_to_media = False
         for file_info in torrent_files:
             torrent_file_path = os.path.join(torrent['save_path'], file_info['name'])
-
-            # Find the corresponding media file by name search
             media_file_path = find_media_path(torrent_file_path)
 
             if not media_file_path:
@@ -87,3 +73,20 @@ def run_cleanup():
 
         if not is_linked_to_media:
             print(f"Torrent '{torrent['name']}' is not linked to a media file. Tagging as '{ORPHAN_TAG}'.")
+            orphaned_hashes.append(torrent['hash'])
+        else:
+            print(f"Torrent '{torrent['name']}' is linked to media. No action needed.")
+
+    if orphaned_hashes:
+        print(f"Tagging {len(orphaned_hashes)} torrents with '{ORPHAN_TAG}'...")
+        qb.add_tags(orphaned_hashes, ORPHAN_TAG)
+    else:
+        print("No orphaned torrents to tag.")
+    
+    print("Cleanup complete.")
+
+if __name__ == "__main__":
+    while True:
+        run_cleanup()
+        print("Waiting for 1 hour before next run...")
+        time.sleep(3600)
