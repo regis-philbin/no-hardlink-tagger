@@ -48,18 +48,28 @@ def run_cleanup():
     if not qb:
         return
 
-    torrents = qb.torrents_info()
+    # Correct method call: qb.torrents()
+    try:
+        torrents = qb.torrents()
+    except Exception as e:
+        print(f"Error fetching torrents from qBittorrent: {e}")
+        return
+
     orphaned_hashes = []
 
     for torrent in torrents:
-        if not torrent.save_path.startswith(DOWNLOADS_DIR):
+        # We only care about torrents in the downloads directory
+        if not torrent['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
-        torrent_files = qb.get_torrent_files(torrent.hash)
+        # Correct method call: qb.get_torrent_files() requires a hash
+        torrent_files = qb.get_torrent_files(torrent['hash'])
         
         is_linked_to_media = False
         for file_info in torrent_files:
-            torrent_file_path = os.path.join(torrent.save_path, file_info.name)
+            torrent_file_path = os.path.join(torrent['save_path'], file_info['name'])
+
+            # Find the corresponding media file by name search
             media_file_path = find_media_path(torrent_file_path)
 
             if not media_file_path:
@@ -76,21 +86,4 @@ def run_cleanup():
                 pass
 
         if not is_linked_to_media:
-            print(f"Torrent '{torrent.name}' is not linked to a media file. Tagging as '{ORPHAN_TAG}'.")
-            orphaned_hashes.append(torrent.hash)
-        else:
-            print(f"Torrent '{torrent.name}' is linked to media. No action needed.")
-
-    if orphaned_hashes:
-        print(f"Tagging {len(orphaned_hashes)} torrents with '{ORPHAN_TAG}'...")
-        qb.add_tags(orphaned_hashes, ORPHAN_TAG)
-    else:
-        print("No orphaned torrents to tag.")
-    
-    print("Cleanup complete.")
-
-if __name__ == "__main__":
-    while True:
-        run_cleanup()
-        print("Waiting for 1 hour before next run...")
-        time.sleep(3600)
+            print(f"Torrent '{torrent['name']}' is not linked to a media file. Tagging as '{ORPHAN_TAG}'.")
