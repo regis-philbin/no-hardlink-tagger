@@ -43,8 +43,8 @@ def run_cleanup():
     if not qb:
         return
 
-    # Corrected method call: qb.torrents_info()
-    torrents = qb.torrents_info()
+    # Correct method call: qb.torrents()
+    torrents = qb.torrents()
     orphaned_hashes = []
 
     for torrent in torrents:
@@ -52,7 +52,7 @@ def run_cleanup():
         if not torrent['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
-        # Corrected method call: qb.get_torrent_files() requires a hash
+        # Correct method call: qb.get_torrent_files() requires a hash
         torrent_files = qb.get_torrent_files(torrent['hash'])
         
         is_linked_to_media = False
