@@ -3,15 +3,15 @@ import time
 from qbittorrent import Client
 
 # --- Configuration ---
-# Use .get() to prevent crashes and provide a clear error message
+# Use .get() for safety against missing variables
 QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
-# Check if required variables are set before proceeding
+# Exit if critical variables are missing
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     print("Error: Missing one or more required qBittorrent environment variables.")
-    print("Please check QBITTORRENT_URL, QBITTORRENT_USER, and QBITTORRENT_PASS.")
+    print("Please check QBITTORRENT_URL, QBITTORRENT_USER, and QBITTORRENT_PASS in your Portainer stack.")
     exit(1)
 
 ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
@@ -48,7 +48,6 @@ def run_cleanup():
     if not qb:
         return
 
-    # Correct method call: qb.torrents()
     try:
         torrents = qb.torrents()
     except Exception as e:
@@ -58,18 +57,14 @@ def run_cleanup():
     orphaned_hashes = []
 
     for torrent in torrents:
-        # We only care about torrents in the downloads directory
         if not torrent['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
-        # Correct method call: qb.get_torrent_files() requires a hash
         torrent_files = qb.get_torrent_files(torrent['hash'])
         
         is_linked_to_media = False
         for file_info in torrent_files:
             torrent_file_path = os.path.join(torrent['save_path'], file_info['name'])
-
-            # Find the corresponding media file by name search
             media_file_path = find_media_path(torrent_file_path)
 
             if not media_file_path:
