@@ -6,6 +6,9 @@ services:
     container_name: no-hardlink-tagger
     restart: unless-stopped
     environment:
+      - PUID=0
+      - PGID=0
+      - TZ=America/New_York
       - QBITTORRENT_URL=${QBITTORRENT_URL}
       - QBITTORRENT_USER=${QBITTORRENT_USER}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS}
