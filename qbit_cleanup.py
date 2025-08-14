@@ -3,18 +3,23 @@ import time
 from datetime import datetime
 from qbittorrent import Client
 import requests
+from collections import defaultdict
 
-VERSION = "no-hardlink-tagger v1.4 — HTTP tagging mode (requests)"
+VERSION = "no-hardlink-tagger v1.5 — indexed mode + batch tagging"
 
 # --- Configuration ---
 QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
-ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
+ORPHAN_TAG   = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
-MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
-DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # keep short until fixed
+MEDIA_DIRS    = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
+
+# Debug knobs
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))   # seconds between runs
+BATCH_SIZE     = int(os.environ.get('BATCH_SIZE', '25'))       # tag this many at a time
+MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))      # 0 = no limit; for quick tests set e.g. 50
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
@@ -40,7 +45,6 @@ def get_qb_client():
 def _api_session():
     try:
         s = requests.Session()
-        # Some builds require both Referer and Origin to pass CSRF/host checks
         s.headers.update({
             'Referer': f"{QBITTORRENT_URL}/",
             'Origin': QBITTORRENT_URL,
@@ -74,7 +78,6 @@ def _api_post(path, data):
 def add_tag_http(hashes, tag):
     if not hashes:
         return
-    log(f"Tagging {len(hashes)} torrent(s) with '{tag}' ...")
     ok, code, text = _api_post('torrents/addTags',
                                {'hashes': '|'.join(hashes), 'tags': tag})
     if ok:
@@ -85,7 +88,6 @@ def add_tag_http(hashes, tag):
 def remove_tag_http(hashes, tag):
     if not hashes:
         return
-    log(f"Removing tag '{tag}' from {len(hashes)} torrent(s) ...")
     ok, code, text = _api_post('torrents/removeTags',
                                {'hashes': '|'.join(hashes), 'tags': tag})
     if ok:
@@ -93,21 +95,40 @@ def remove_tag_http(hashes, tag):
     else:
         log(f"❌ removeTags failed ({code}): {text}")
 
-def find_media_path(torrent_file_path):
-    fn = os.path.basename(torrent_file_path)
+# --- Build media index once per cycle ---
+def build_media_index():
+    start = time.time()
+    index = defaultdict(set)  # filename -> set of inodes
+    files_count = 0
     for media_dir in MEDIA_DIRS:
         for root, _, files in os.walk(media_dir):
-            if fn in files:
-                return os.path.join(root, fn)
-    return None
+            for fn in files:
+                path = os.path.join(root, fn)
+                try:
+                    inode = os.stat(path).st_ino
+                except FileNotFoundError:
+                    continue
+                except Exception as e:
+                    log(f"⚠ stat error in media index: {e}")
+                    continue
+                index[fn].add(inode)
+                files_count += 1
+    elapsed = time.time() - start
+    log(f"📚 Media index built: {files_count} files across {len(MEDIA_DIRS)} dir(s) in {elapsed:.1f}s "
+        f"({len(index)} unique basenames).")
+    return index
 
 def run_cleanup():
     log(f"{VERSION} — url={QBITTORRENT_URL}")
     log("Starting cleanup cycle...")
+
     qb = get_qb_client()
     if not qb:
         log("No connection to qBittorrent, skipping this cycle.")
         return
+
+    # Build index once
+    media_index = build_media_index()
 
     try:
         torrents = qb.torrents()
@@ -115,10 +136,20 @@ def run_cleanup():
         log(f"Error fetching torrents: {e}")
         return
 
-    orphaned_hashes = []
-    linked_hashes_with_tag = []
+    if MAX_TORRENTS > 0:
+        torrents = torrents[:MAX_TORRENTS]
+        log(f"⚙ Limiting to first {MAX_TORRENTS} torrents for this run (MAX_TORRENTS).")
 
+    orphan_batch = []
+    untag_batch = []
+
+    processed = 0
     for t in torrents:
+        processed += 1
+        if processed % 50 == 0:
+            log(f"…processed {processed}/{len(torrents)} torrents so far.")
+
+        # Only consider torrents saved under DOWNLOADS_DIR
         if not t['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
@@ -127,51 +158,53 @@ def run_cleanup():
 
         # Skip unchanged orphans
         if has_orphan_tag and completion_time == last_checked_completion_time.get(t['hash']):
-            log(f"⏩ Skipping '{t['name']}' (unchanged orphan).")
             continue
 
-        # Get files
+        # Fetch file list once
         try:
             files = qb.get_torrent_files(t['hash'])
         except Exception as e:
             log(f"⚠ Could not fetch files for '{t['name']}': {e}")
             files = []
 
-        # Check for hardlink match
         is_linked_to_media = False
         for fi in files:
             torrent_path = os.path.join(t['save_path'], fi['name'])
-            media_path = find_media_path(torrent_path)
-            if not media_path:
-                continue
+            fn = os.path.basename(torrent_path)
             try:
-                if os.stat(torrent_path).st_ino == os.stat(media_path).st_ino:
-                    is_linked_to_media = True
-                    break
+                t_inode = os.stat(torrent_path).st_ino
             except FileNotFoundError:
-                pass
+                continue
             except Exception as e:
-                log(f"⚠ stat error on '{t['name']}': {e}")
+                log(f"⚠ stat error on torrent file: {e}")
+                continue
+
+            # fast lookup: is this torrent file's inode in the media index for same basename?
+            if t_inode in media_index.get(fn, ()):
+                is_linked_to_media = True
+                break
 
         if not is_linked_to_media:
             log(f"Torrent '{t['name']}' has no media link. Will tag '{ORPHAN_TAG}'.")
-            orphaned_hashes.append(t['hash'])
+            orphan_batch.append(t['hash'])
+            if len(orphan_batch) >= BATCH_SIZE:
+                add_tag_http(orphan_batch, ORPHAN_TAG)
+                orphan_batch.clear()
         else:
-            log(f"Torrent '{t['name']}' is linked to media.")
             if has_orphan_tag:
-                linked_hashes_with_tag.append(t['hash'])
+                untag_batch.append(t['hash'])
+                if len(untag_batch) >= BATCH_SIZE:
+                    remove_tag_http(untag_batch, ORPHAN_TAG)
+                    untag_batch.clear()
 
         last_checked_completion_time[t['hash']] = completion_time
 
-    # Actually tag/untag (and log HTTP status)
-    if orphaned_hashes:
-        add_tag_http(orphaned_hashes, ORPHAN_TAG)
-    if linked_hashes_with_tag:
-        remove_tag_http(linked_hashes_with_tag, ORPHAN_TAG)
+    # Flush remaining batches
+    if orphan_batch:
+        add_tag_http(orphan_batch, ORPHAN_TAG)
+    if untag_batch:
+        remove_tag_http(untag_batch, ORPHAN_TAG)
 
-    log(f"📊 Summary: {len(orphaned_hashes)} tagged, {len(linked_hashes_with_tag)} untagged.")
-    if not orphaned_hashes and not linked_hashes_with_tag:
-        log("No tagging changes needed.")
     log("Cleanup cycle complete.")
 
 if __name__ == "__main__":
