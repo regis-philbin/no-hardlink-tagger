@@ -16,8 +16,8 @@ services:
       - DOWNLOADS_DIR=/media/downloads
       - MEDIA_DIRS=/media/movies,/media/tv
       - DEBUG_INTERVAL=60   # Time in seconds between cleanup cycles
-      - BATCH_SIZE=10
-      - MAX_TORRENTS=100
+      - BATCH_SIZE=50
+      - MAX_TORRENTS=10
     volumes:
       # Mount media directories
       - /media:/media
