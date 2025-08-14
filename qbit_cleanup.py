@@ -168,3 +168,14 @@ def run_cleanup():
         add_tag_http(orphaned_hashes, ORPHAN_TAG)
     if linked_hashes_with_tag:
         remove_tag_http(linked_hashes_with_tag, ORPHAN_TAG)
+
+    log(f"📊 Summary: {len(orphaned_hashes)} tagged, {len(linked_hashes_with_tag)} untagged.")
+    if not orphaned_hashes and not linked_hashes_with_tag:
+        log("No tagging changes needed.")
+    log("Cleanup cycle complete.")
+
+if __name__ == "__main__":
+    while True:
+        run_cleanup()
+        log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
+        time.sleep(DEBUG_INTERVAL)
