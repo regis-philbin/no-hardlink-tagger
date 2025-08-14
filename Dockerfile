@@ -2,7 +2,9 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-RUN pip install python-qbittorrent
+# Upgrade pip and install the latest python-qbittorrent
+RUN pip install --upgrade pip
+RUN pip install --upgrade python-qbittorrent
 
 COPY qbit_cleanup.py .
 
