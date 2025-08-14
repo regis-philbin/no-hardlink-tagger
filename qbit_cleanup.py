@@ -17,9 +17,8 @@ if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
 ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
-DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '3600'))
 
-# Track last checked completion times to skip unchanged orphans
 last_checked_completion_time = {}
 
 # --- Logging helper ---
@@ -45,20 +44,20 @@ def find_media_path(torrent_file_path):
                 return os.path.join(root, torrent_filename)
     return None
 
-# --- Tag helpers ---
+# --- Tag helpers using low-level _post (works on qBittorrent 5.1.2) ---
 def add_tag(qb, hashes, tag):
     if hashes:
         try:
-            qb.torrents_add_tags(hashes=hashes, tags=tag)
-            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}'.")
+            qb._post('torrents/addTags', data={'hashes': '|'.join(hashes), 'tags': tag})
+            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}'")
         except Exception as e:
             log(f"❌ Error tagging torrents: {e}")
 
 def remove_tag(qb, hashes, tag):
     if hashes:
         try:
-            qb.torrents_remove_tags(hashes=hashes, tags=tag)
-            log(f"🗑 Removed tag '{tag}' from {len(hashes)} torrent(s).")
+            qb._post('torrents/removeTags', data={'hashes': '|'.join(hashes), 'tags': tag})
+            log(f"🗑 Removed tag '{tag}' from {len(hashes)} torrent(s)")
         except Exception as e:
             log(f"❌ Error removing tag '{tag}': {e}")
 
