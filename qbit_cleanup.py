@@ -66,4 +66,70 @@ def tag_torrents(qb, hashes, tag):
         return
     ensure_tag_exists(qb, tag)
     try:
-        qb._post('torrents/ad_
+        qb._post('torrents/addTags', data={
+            'hashes': '|'.join(hashes),
+            'tags': tag
+        })
+        log(f"✅ Successfully tagged {len(hashes)} torrent(s) with '{tag}'.")
+    except Exception as e:
+        log(f"❌ Error tagging torrents: {e}")
+
+# --- Main cleanup ---
+def run_cleanup():
+    log("Starting cleanup cycle...")
+    qb = get_qb_client()
+    if not qb:
+        log("No connection to qBittorrent, skipping this cycle.")
+        return
+
+    try:
+        torrents = qb.torrents()
+    except Exception as e:
+        log(f"Error fetching torrents: {e}")
+        return
+
+    orphaned_hashes = []
+
+    for torrent in torrents:
+        if not torrent['save_path'].startswith(DOWNLOADS_DIR):
+            continue
+
+        torrent_files = qb.get_torrent_files(torrent['hash'])
+        
+        is_linked_to_media = False
+        for file_info in torrent_files:
+            torrent_file_path = os.path.join(torrent['save_path'], file_info['name'])
+            media_file_path = find_media_path(torrent_file_path)
+
+            if not media_file_path:
+                continue
+
+            try:
+                torrent_inode = os.stat(torrent_file_path).st_ino
+                media_inode = os.stat(media_file_path).st_ino
+
+                if torrent_inode == media_inode:
+                    is_linked_to_media = True
+                    break
+            except FileNotFoundError:
+                pass
+
+        if not is_linked_to_media:
+            log(f"Torrent '{torrent['name']}' has no media link. Will tag '{ORPHAN_TAG}'.")
+            orphaned_hashes.append(torrent['hash'])
+        else:
+            log(f"Torrent '{torrent['name']}' is linked to media. No action.")
+
+    if orphaned_hashes:
+        tag_torrents(qb, orphaned_hashes, ORPHAN_TAG)
+    else:
+        log("No orphaned torrents to tag.")
+
+    log("Cleanup cycle complete.")
+
+# --- Loop ---
+if __name__ == "__main__":
+    while True:
+        run_cleanup()
+        log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
+        time.sleep(DEBUG_INTERVAL)
