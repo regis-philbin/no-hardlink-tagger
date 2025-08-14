@@ -1,39 +1,42 @@
 import os
 import time
+from datetime import datetime
 from qbittorrent import Client
 
 # --- Configuration ---
-# Use .get() for safety against missing variables
 QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
-# Exit if critical variables are missing
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
-    print("Error: Missing one or more required qBittorrent environment variables.")
-    print("Please check QBITTORRENT_URL, QBITTORRENT_USER, and QBITTORRENT_PASS in your Portainer stack.")
+    def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
+    log("Error: Missing one or more required qBittorrent environment variables.")
+    log("Please check QBITTORRENT_URL, QBITTORRENT_USER, and QBITTORRENT_PASS.")
+    time.sleep(9999)  # Keep container alive for inspection
     exit(1)
 
 ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
+# Debug: shorter loop interval (seconds)
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # 30 sec default in debug mode
+
+# --- Helper logging ---
+def log(msg):
+    print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
+
 # --- Script Logic ---
 def get_qb_client():
-    """Connects to the qBittorrent client."""
     try:
         qb = Client(QBITTORRENT_URL)
         qb.login(QBITTORRENT_USER, QBITTORRENT_PASS)
         return qb
     except Exception as e:
-        print(f"Error connecting to qBittorrent: {e}")
+        log(f"Error connecting to qBittorrent: {e}")
         return None
 
 def find_media_path(torrent_file_path):
-    """
-    Finds the corresponding media path for a torrent file by searching for the
-    file name within the media directories.
-    """
     torrent_filename = os.path.basename(torrent_file_path)
     for media_dir in MEDIA_DIRS:
         for root, dirs, files in os.walk(media_dir):
@@ -42,16 +45,16 @@ def find_media_path(torrent_file_path):
     return None
 
 def run_cleanup():
-    """Main function to perform the cleanup."""
-    print("Starting qBittorrent cleanup script...")
+    log("Starting cleanup cycle...")
     qb = get_qb_client()
     if not qb:
+        log("No connection to qBittorrent, skipping this cycle.")
         return
 
     try:
         torrents = qb.torrents()
     except Exception as e:
-        print(f"Error fetching torrents from qBittorrent: {e}")
+        log(f"Error fetching torrents: {e}")
         return
 
     orphaned_hashes = []
@@ -81,21 +84,21 @@ def run_cleanup():
                 pass
 
         if not is_linked_to_media:
-            print(f"Torrent '{torrent['name']}' is not linked to a media file. Tagging as '{ORPHAN_TAG}'.")
+            log(f"Torrent '{torrent['name']}' has no media link. Tagging '{ORPHAN_TAG}'.")
             orphaned_hashes.append(torrent['hash'])
         else:
-            print(f"Torrent '{torrent['name']}' is linked to media. No action needed.")
+            log(f"Torrent '{torrent['name']}' is linked to media. No action.")
 
     if orphaned_hashes:
-        print(f"Tagging {len(orphaned_hashes)} torrents with '{ORPHAN_TAG}'...")
+        log(f"Tagging {len(orphaned_hashes)} torrents as '{ORPHAN_TAG}'...")
         qb.add_tags(orphaned_hashes, ORPHAN_TAG)
     else:
-        print("No orphaned torrents to tag.")
-    
-    print("Cleanup complete.")
+        log("No orphaned torrents to tag.")
+
+    log("Cleanup cycle complete.")
 
 if __name__ == "__main__":
     while True:
         run_cleanup()
-        print("Waiting for 1 hour before next run...")
-        time.sleep(3600)
+        log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
+        time.sleep(DEBUG_INTERVAL)
