@@ -12,10 +12,12 @@ services:
       - QBITTORRENT_URL=${QBITTORRENT_URL}
       - QBITTORRENT_USER=${QBITTORRENT_USER}
       - QBITTORRENT_PASS=${QBITTORRENT_PASS}
-      - ORPHAN_TAG=${ORPHAN_TAG}
-      - DOWNLOADS_DIR=${DOWNLOADS_DIR}
-      - MEDIA_DIRS=${MEDIA_DIRS}
-      - DEBUG_INTERVAL=3600   # Time in seconds between cleanup cycles
+      - ORPHAN_TAG=NoMediaLink
+      - DOWNLOADS_DIR=/media/downloads
+      - MEDIA_DIRS=/media/movies,/media/tv
+      - DEBUG_INTERVAL=60   # Time in seconds between cleanup cycles
+      - BATCH_SIZE=10
+      - MAX_TORRENTS=100
     volumes:
       # Mount media directories
       - /media:/media
