@@ -46,14 +46,25 @@ def find_media_path(torrent_file_path):
     return None
 
 # --- Tag helpers ---
+def ensure_tag_exists(qb, tag):
+    try:
+        existing_tags = qb._get('torrents/tags')
+        tag_names = [t['name'] if isinstance(t, dict) else t for t in existing_tags]
+        if tag not in tag_names:
+            qb._post('torrents/createTags', data={'tags': tag})
+            log(f"🆕 Created tag '{tag}' in qBittorrent.")
+    except Exception as e:
+        log(f"⚠ Could not check/create tag '{tag}': {e}")
+
 def add_tag(qb, hashes, tag):
     if hashes:
+        ensure_tag_exists(qb, tag)
         try:
             qb._post('torrents/addTags', data={
                 'hashes': '|'.join(hashes),
                 'tags': tag
             })
-            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}' (created automatically if missing).")
+            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}'.")
         except Exception as e:
             log(f"❌ Error tagging torrents: {e}")
 
