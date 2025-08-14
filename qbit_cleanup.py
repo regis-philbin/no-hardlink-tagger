@@ -21,6 +21,9 @@ MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/me
 
 DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # Seconds between runs
 
+# Track last scan timestamps per torrent
+last_checked_completion_time = {}
+
 # --- Logging helper ---
 def log(msg):
     print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
@@ -44,7 +47,7 @@ def find_media_path(torrent_file_path):
                 return os.path.join(root, torrent_filename)
     return None
 
-# --- Tagging helpers ---
+# --- Tag helpers ---
 def ensure_tag_exists(qb, tag):
     try:
         existing_tags = qb._get('torrents/tags')
@@ -54,25 +57,34 @@ def ensure_tag_exists(qb, tag):
                 qb._post('torrents/createTags', data={'tags': tag})
                 log(f"🆕 Created tag '{tag}' in qBittorrent.")
         else:
-            # If API returns string list instead of dicts
             if tag not in existing_tags:
                 qb._post('torrents/createTags', data={'tags': tag})
                 log(f"🆕 Created tag '{tag}' in qBittorrent.")
     except Exception as e:
         log(f"⚠ Could not check/create tag '{tag}': {e}")
 
-def tag_torrents(qb, hashes, tag):
-    if not hashes:
-        return
-    ensure_tag_exists(qb, tag)
-    try:
-        qb._post('torrents/addTags', data={
-            'hashes': '|'.join(hashes),
-            'tags': tag
-        })
-        log(f"✅ Successfully tagged {len(hashes)} torrent(s) with '{tag}'.")
-    except Exception as e:
-        log(f"❌ Error tagging torrents: {e}")
+def add_tag(qb, hashes, tag):
+    if hashes:
+        ensure_tag_exists(qb, tag)
+        try:
+            qb._post('torrents/addTags', data={
+                'hashes': '|'.join(hashes),
+                'tags': tag
+            })
+            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}'.")
+        except Exception as e:
+            log(f"❌ Error tagging torrents: {e}")
+
+def remove_tag(qb, hashes, tag):
+    if hashes:
+        try:
+            qb._post('torrents/removeTags', data={
+                'hashes': '|'.join(hashes),
+                'tags': tag
+            })
+            log(f"🗑 Removed tag '{tag}' from {len(hashes)} torrent(s).")
+        except Exception as e:
+            log(f"❌ Error removing tag '{tag}': {e}")
 
 # --- Main cleanup ---
 def run_cleanup():
@@ -89,14 +101,23 @@ def run_cleanup():
         return
 
     orphaned_hashes = []
+    linked_hashes_with_tag = []
 
     for torrent in torrents:
         if not torrent['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
+        has_orphan_tag = ORPHAN_TAG in torrent.get('tags', '')
+        completion_time = torrent.get('completion_on', 0)
+
+        # Skip already tagged torrents that haven't changed since last check
+        if has_orphan_tag and completion_time == last_checked_completion_time.get(torrent['hash']):
+            log(f"⏩ Skipping '{torrent['name']}' (unchanged orphan).")
+            continue
+
         torrent_files = qb.get_torrent_files(torrent['hash'])
-        
         is_linked_to_media = False
+
         for file_info in torrent_files:
             torrent_file_path = os.path.join(torrent['save_path'], file_info['name'])
             media_file_path = find_media_path(torrent_file_path)
@@ -118,12 +139,23 @@ def run_cleanup():
             log(f"Torrent '{torrent['name']}' has no media link. Will tag '{ORPHAN_TAG}'.")
             orphaned_hashes.append(torrent['hash'])
         else:
-            log(f"Torrent '{torrent['name']}' is linked to media. No action.")
+            log(f"Torrent '{torrent['name']}' is linked to media.")
+            if has_orphan_tag:
+                linked_hashes_with_tag.append(torrent['hash'])
 
+        # Save last checked completion time
+        last_checked_completion_time[torrent['hash']] = completion_time
+
+    # Apply and remove tags
     if orphaned_hashes:
-        tag_torrents(qb, orphaned_hashes, ORPHAN_TAG)
-    else:
-        log("No orphaned torrents to tag.")
+        add_tag(qb, orphaned_hashes, ORPHAN_TAG)
+    if linked_hashes_with_tag:
+        remove_tag(qb, linked_hashes_with_tag, ORPHAN_TAG)
+
+    # --- Summary ---
+    log(f"📊 Summary: {len(orphaned_hashes)} tagged, {len(linked_hashes_with_tag)} untagged.")
+    if not orphaned_hashes and not linked_hashes_with_tag:
+        log("No tagging changes needed.")
 
     log("Cleanup cycle complete.")
 
