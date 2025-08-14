@@ -18,3 +18,4 @@ services:
     volumes:
       # Mount all the relevant directories
       - /media:/media
+      - ./configs/:/config
