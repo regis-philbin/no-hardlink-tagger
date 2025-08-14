@@ -20,13 +20,13 @@ DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
 # Debug: shorter loop interval (seconds)
-DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # 30 sec default in debug mode
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # Default 30 sec for debug
 
-# --- Helper logging ---
+# --- Logging helper ---
 def log(msg):
     print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
 
-# --- Script Logic ---
+# --- qBittorrent connection ---
 def get_qb_client():
     try:
         qb = Client(QBITTORRENT_URL)
@@ -36,6 +36,7 @@ def get_qb_client():
         log(f"Error connecting to qBittorrent: {e}")
         return None
 
+# --- Media search ---
 def find_media_path(torrent_file_path):
     torrent_filename = os.path.basename(torrent_file_path)
     for media_dir in MEDIA_DIRS:
@@ -44,6 +45,20 @@ def find_media_path(torrent_file_path):
                 return os.path.join(root, torrent_filename)
     return None
 
+# --- Tagging helper ---
+def tag_torrents(qb, hashes, tag):
+    if not hashes:
+        return
+    try:
+        qb._post('torrents/addTags', data={
+            'hashes': '|'.join(hashes),
+            'tags': tag
+        })
+        log(f"✅ Successfully tagged {len(hashes)} torrent(s) with '{tag}'.")
+    except Exception as e:
+        log(f"❌ Error tagging torrents: {e}")
+
+# --- Main cleanup ---
 def run_cleanup():
     log("Starting cleanup cycle...")
     qb = get_qb_client()
@@ -84,19 +99,19 @@ def run_cleanup():
                 pass
 
         if not is_linked_to_media:
-            log(f"Torrent '{torrent['name']}' has no media link. Tagging '{ORPHAN_TAG}'.")
+            log(f"Torrent '{torrent['name']}' has no media link. Will tag '{ORPHAN_TAG}'.")
             orphaned_hashes.append(torrent['hash'])
         else:
             log(f"Torrent '{torrent['name']}' is linked to media. No action.")
 
     if orphaned_hashes:
-        log(f"Tagging {len(orphaned_hashes)} torrents as '{ORPHAN_TAG}'...")
-        qb.add_tags(orphaned_hashes, ORPHAN_TAG)
+        tag_torrents(qb, orphaned_hashes, ORPHAN_TAG)
     else:
         log("No orphaned torrents to tag.")
 
     log("Cleanup cycle complete.")
 
+# --- Loop ---
 if __name__ == "__main__":
     while True:
         run_cleanup()
