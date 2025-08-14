@@ -10,18 +10,16 @@ QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
-    log("Error: Missing one or more required qBittorrent environment variables.")
-    log("Please check QBITTORRENT_URL, QBITTORRENT_USER, and QBITTORRENT_PASS.")
-    time.sleep(9999)  # Keep container alive for inspection
+    log("Error: Missing required qBittorrent environment variables.")
+    time.sleep(9999)
     exit(1)
 
 ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'orphaned')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))
 
-DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # Seconds between runs
-
-# Track last scan timestamps per torrent
+# Track last checked completion times to skip unchanged orphans
 last_checked_completion_time = {}
 
 # --- Logging helper ---
@@ -48,30 +46,14 @@ def find_media_path(torrent_file_path):
     return None
 
 # --- Tag helpers ---
-def ensure_tag_exists(qb, tag):
-    try:
-        existing_tags = qb._get('torrents/tags')
-        if isinstance(existing_tags, list):
-            tag_names = [t['name'] if isinstance(t, dict) else t for t in existing_tags]
-            if tag not in tag_names:
-                qb._post('torrents/createTags', data={'tags': tag})
-                log(f"🆕 Created tag '{tag}' in qBittorrent.")
-        else:
-            if tag not in existing_tags:
-                qb._post('torrents/createTags', data={'tags': tag})
-                log(f"🆕 Created tag '{tag}' in qBittorrent.")
-    except Exception as e:
-        log(f"⚠ Could not check/create tag '{tag}': {e}")
-
 def add_tag(qb, hashes, tag):
     if hashes:
-        ensure_tag_exists(qb, tag)
         try:
             qb._post('torrents/addTags', data={
                 'hashes': '|'.join(hashes),
                 'tags': tag
             })
-            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}'.")
+            log(f"✅ Tagged {len(hashes)} torrent(s) with '{tag}' (created automatically if missing).")
         except Exception as e:
             log(f"❌ Error tagging torrents: {e}")
 
@@ -110,7 +92,7 @@ def run_cleanup():
         has_orphan_tag = ORPHAN_TAG in torrent.get('tags', '')
         completion_time = torrent.get('completion_on', 0)
 
-        # Skip already tagged torrents that haven't changed since last check
+        # Skip unchanged orphans
         if has_orphan_tag and completion_time == last_checked_completion_time.get(torrent['hash']):
             log(f"⏩ Skipping '{torrent['name']}' (unchanged orphan).")
             continue
@@ -143,7 +125,6 @@ def run_cleanup():
             if has_orphan_tag:
                 linked_hashes_with_tag.append(torrent['hash'])
 
-        # Save last checked completion time
         last_checked_completion_time[torrent['hash']] = completion_time
 
     # Apply and remove tags
@@ -152,7 +133,7 @@ def run_cleanup():
     if linked_hashes_with_tag:
         remove_tag(qb, linked_hashes_with_tag, ORPHAN_TAG)
 
-    # --- Summary ---
+    # Summary
     log(f"📊 Summary: {len(orphaned_hashes)} tagged, {len(linked_hashes_with_tag)} untagged.")
     if not orphaned_hashes and not linked_hashes_with_tag:
         log("No tagging changes needed.")
