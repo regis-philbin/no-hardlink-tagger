@@ -15,6 +15,9 @@ services:
       - ORPHAN_TAG=${ORPHAN_TAG}
       - DOWNLOADS_DIR=${DOWNLOADS_DIR}
       - MEDIA_DIRS=${MEDIA_DIRS}
+      - DEBUG_INTERVAL=3600   # Time in seconds between cleanup cycles
     volumes:
-      # Mount all the relevant directories
+      # Mount media directories
       - /media:/media
+    # Optional: use host networking if container cannot reach qBittorrent
+    # network_mode: "host"
