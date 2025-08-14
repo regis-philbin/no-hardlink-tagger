@@ -3,23 +3,24 @@ import time
 from datetime import datetime
 from qbittorrent import Client
 import requests
+
 from collections import defaultdict
 
-VERSION = "no-hardlink-tagger v1.5 — indexed mode + batch tagging"
+VERSION = "no-hardlink-tagger v1.6 — inode-only matching"
 
 # --- Configuration ---
 QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
 
-ORPHAN_TAG   = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
+ORPHAN_TAG    = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
 DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
 MEDIA_DIRS    = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
 
 # Debug knobs
-DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))   # seconds between runs
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))   # seconds between runs (short while testing)
 BATCH_SIZE     = int(os.environ.get('BATCH_SIZE', '25'))       # tag this many at a time
-MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))      # 0 = no limit; for quick tests set e.g. 50
+MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))      # 0 = no limit; e.g. 100 for quick tests
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
@@ -78,8 +79,7 @@ def _api_post(path, data):
 def add_tag_http(hashes, tag):
     if not hashes:
         return
-    ok, code, text = _api_post('torrents/addTags',
-                               {'hashes': '|'.join(hashes), 'tags': tag})
+    ok, code, text = _api_post('torrents/addTags', {'hashes': '|'.join(hashes), 'tags': tag})
     if ok:
         log(f"✅ addTags OK: tagged {len(hashes)} torrent(s) with '{tag}'.")
     else:
@@ -88,35 +88,34 @@ def add_tag_http(hashes, tag):
 def remove_tag_http(hashes, tag):
     if not hashes:
         return
-    ok, code, text = _api_post('torrents/removeTags',
-                               {'hashes': '|'.join(hashes), 'tags': tag})
+    ok, code, text = _api_post('torrents/removeTags', {'hashes': '|'.join(hashes), 'tags': tag})
     if ok:
         log(f"🗑 removeTags OK: removed '{tag}' from {len(hashes)} torrent(s).")
     else:
         log(f"❌ removeTags failed ({code}): {text}")
 
-# --- Build media index once per cycle ---
-def build_media_index():
+# --- Build a set of (device, inode) for ALL media files (filename ignored) ---
+def build_media_inode_set():
     start = time.time()
-    index = defaultdict(set)  # filename -> set of inodes
+    inode_set = set()
     files_count = 0
     for media_dir in MEDIA_DIRS:
         for root, _, files in os.walk(media_dir):
             for fn in files:
                 path = os.path.join(root, fn)
                 try:
-                    inode = os.stat(path).st_ino
+                    st = os.stat(path)  # follow symlinks; hardlink detection relies on st_ino
                 except FileNotFoundError:
                     continue
                 except Exception as e:
                     log(f"⚠ stat error in media index: {e}")
                     continue
-                index[fn].add(inode)
+                inode_set.add((st.st_dev, st.st_ino))
                 files_count += 1
     elapsed = time.time() - start
-    log(f"📚 Media index built: {files_count} files across {len(MEDIA_DIRS)} dir(s) in {elapsed:.1f}s "
-        f"({len(index)} unique basenames).")
-    return index
+    log(f"📚 Media inode set built: {files_count} files across {len(MEDIA_DIRS)} dir(s) "
+        f"in {elapsed:.1f}s ({len(inode_set)} unique (dev,inode) pairs).")
+    return inode_set
 
 def run_cleanup():
     log(f"{VERSION} — url={QBITTORRENT_URL}")
@@ -127,8 +126,7 @@ def run_cleanup():
         log("No connection to qBittorrent, skipping this cycle.")
         return
 
-    # Build index once
-    media_index = build_media_index()
+    media_inodes = build_media_inode_set()
 
     try:
         torrents = qb.torrents()
@@ -141,13 +139,11 @@ def run_cleanup():
         log(f"⚙ Limiting to first {MAX_TORRENTS} torrents for this run (MAX_TORRENTS).")
 
     orphan_batch = []
-    untag_batch = []
+    untag_batch  = []
 
-    processed = 0
-    for t in torrents:
-        processed += 1
-        if processed % 50 == 0:
-            log(f"…processed {processed}/{len(torrents)} torrents so far.")
+    for i, t in enumerate(torrents, 1):
+        if i % 50 == 0:
+            log(f"…processed {i}/{len(torrents)} torrents so far.")
 
         # Only consider torrents saved under DOWNLOADS_DIR
         if not t['save_path'].startswith(DOWNLOADS_DIR):
@@ -167,20 +163,19 @@ def run_cleanup():
             log(f"⚠ Could not fetch files for '{t['name']}': {e}")
             files = []
 
+        # Check by (st_dev, st_ino) ONLY — filename is irrelevant now
         is_linked_to_media = False
         for fi in files:
             torrent_path = os.path.join(t['save_path'], fi['name'])
-            fn = os.path.basename(torrent_path)
             try:
-                t_inode = os.stat(torrent_path).st_ino
+                st = os.stat(torrent_path)
             except FileNotFoundError:
                 continue
             except Exception as e:
                 log(f"⚠ stat error on torrent file: {e}")
                 continue
 
-            # fast lookup: is this torrent file's inode in the media index for same basename?
-            if t_inode in media_index.get(fn, ()):
+            if (st.st_dev, st.st_ino) in media_inodes:
                 is_linked_to_media = True
                 break
 
