@@ -4,27 +4,29 @@ from datetime import datetime
 from qbittorrent import Client
 import requests
 
+VERSION = "no-hardlink-tagger v1.4 — HTTP tagging mode (requests)"
+
 # --- Configuration ---
 QBITTORRENT_URL = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
+
+ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
+DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
+MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
+DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '30'))  # keep short until fixed
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
     log("Error: Missing required qBittorrent environment variables.")
     time.sleep(9999); raise SystemExit(1)
 
-ORPHAN_TAG = os.environ.get('ORPHAN_TAG', 'NoMediaLink')
-DOWNLOADS_DIR = os.environ.get('DOWNLOADS_DIR', '/media/downloads')
-MEDIA_DIRS = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,/media/tv').split(',')]
-DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '3600'))
-
 last_checked_completion_time = {}
 
-def log(msg):  # timestamped logging
+def log(msg):
     print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
 
-# --- read-only client (works fine) ---
+# --- read-only client (listing) ---
 def get_qb_client():
     try:
         qb = Client(QBITTORRENT_URL)
@@ -34,15 +36,15 @@ def get_qb_client():
         log(f"Error connecting to qBittorrent: {e}")
         return None
 
-# --- small HTTP helper for write actions (tags) ---
+# --- HTTP session for write calls (tags) ---
 def _api_session():
-    """
-    Fresh session per call; logs in, sets Referer (needed on newer qB WebUI),
-    returns (session, error_text) where error_text is None on success.
-    """
     try:
         s = requests.Session()
-        s.headers.update({'Referer': f"{QBITTORRENT_URL}/"})  # important for CSRF/host checks
+        # Some builds require both Referer and Origin to pass CSRF/host checks
+        s.headers.update({
+            'Referer': f"{QBITTORRENT_URL}/",
+            'Origin': QBITTORRENT_URL,
+        })
         r = s.post(f"{QBITTORRENT_URL}/api/v2/auth/login",
                    data={'username': QBITTORRENT_USER, 'password': QBITTORRENT_PASS},
                    timeout=10)
@@ -60,17 +62,19 @@ def _api_post(path, data):
     try:
         r = s.post(f"{QBITTORRENT_URL}/api/v2/{path}", data=data, timeout=15)
         ok = (r.status_code == 200)
-        if not ok:
-            log(f"❌ POST /api/v2/{path} -> {r.status_code} {r.text.strip()}")
+        if ok:
+            log(f"➡ POST {path} 200 OK")
+        else:
+            log(f"❌ POST {path} -> {r.status_code} {r.text.strip()}")
         return ok, r.status_code, r.text.strip()
     except Exception as e:
-        log(f"❌ POST /api/v2/{path} exception: {e}")
+        log(f"❌ POST {path} exception: {e}")
         return False, None, str(e)
 
-# --- tagging via HTTP API ---
 def add_tag_http(hashes, tag):
     if not hashes:
         return
+    log(f"Tagging {len(hashes)} torrent(s) with '{tag}' ...")
     ok, code, text = _api_post('torrents/addTags',
                                {'hashes': '|'.join(hashes), 'tags': tag})
     if ok:
@@ -81,6 +85,7 @@ def add_tag_http(hashes, tag):
 def remove_tag_http(hashes, tag):
     if not hashes:
         return
+    log(f"Removing tag '{tag}' from {len(hashes)} torrent(s) ...")
     ok, code, text = _api_post('torrents/removeTags',
                                {'hashes': '|'.join(hashes), 'tags': tag})
     if ok:
@@ -88,7 +93,6 @@ def remove_tag_http(hashes, tag):
     else:
         log(f"❌ removeTags failed ({code}): {text}")
 
-# --- media search on host filesystem ---
 def find_media_path(torrent_file_path):
     fn = os.path.basename(torrent_file_path)
     for media_dir in MEDIA_DIRS:
@@ -98,6 +102,7 @@ def find_media_path(torrent_file_path):
     return None
 
 def run_cleanup():
+    log(f"{VERSION} — url={QBITTORRENT_URL}")
     log("Starting cleanup cycle...")
     qb = get_qb_client()
     if not qb:
@@ -114,7 +119,6 @@ def run_cleanup():
     linked_hashes_with_tag = []
 
     for t in torrents:
-        # Only consider torrents saved under DOWNLOADS_DIR
         if not t['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
@@ -126,14 +130,15 @@ def run_cleanup():
             log(f"⏩ Skipping '{t['name']}' (unchanged orphan).")
             continue
 
-        # Inspect files to see if any file is hardlink-equal to media
-        is_linked_to_media = False
+        # Get files
         try:
             files = qb.get_torrent_files(t['hash'])
         except Exception as e:
             log(f"⚠ Could not fetch files for '{t['name']}': {e}")
             files = []
 
+        # Check for hardlink match
+        is_linked_to_media = False
         for fi in files:
             torrent_path = os.path.join(t['save_path'], fi['name'])
             media_path = find_media_path(torrent_path)
@@ -144,7 +149,6 @@ def run_cleanup():
                     is_linked_to_media = True
                     break
             except FileNotFoundError:
-                # Skip missing files
                 pass
             except Exception as e:
                 log(f"⚠ stat error on '{t['name']}': {e}")
@@ -159,19 +163,8 @@ def run_cleanup():
 
         last_checked_completion_time[t['hash']] = completion_time
 
-    # Apply/remove tags via raw HTTP calls (with status logging)
+    # Actually tag/untag (and log HTTP status)
     if orphaned_hashes:
         add_tag_http(orphaned_hashes, ORPHAN_TAG)
     if linked_hashes_with_tag:
         remove_tag_http(linked_hashes_with_tag, ORPHAN_TAG)
-
-    log(f"📊 Summary: {len(orphaned_hashes)} tagged, {len(linked_hashes_with_tag)} untagged.")
-    if not orphaned_hashes and not linked_hashes_with_tag:
-        log("No tagging changes needed.")
-    log("Cleanup cycle complete.")
-
-if __name__ == "__main__":
-    while True:
-        run_cleanup()
-        log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
-        time.sleep(DEBUG_INTERVAL)
