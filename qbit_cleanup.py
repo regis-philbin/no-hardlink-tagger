@@ -6,7 +6,7 @@ import requests
 import hashlib
 from collections import defaultdict
 
-VERSION = "no-hardlink-tagger v1.9 — seeding-aware (nlink + content)"
+VERSION = "no-hardlink-tagger v2.0 — visibility guard + strict seeding"
 
 # --- Config from env ---
 QBITTORRENT_URL  = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
@@ -19,15 +19,20 @@ MEDIA_DIRS    = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,
 
 DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '60'))
 BATCH_SIZE     = int(os.environ.get('BATCH_SIZE', '25'))
-MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))  # 0 = all
+MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))      # 0 = all
 
 # Only treat these as "media files" for linkage detection
 EXT_WHITELIST  = [e.strip().lower() for e in os.environ.get(
     'EXT_WHITELIST',
     '.mkv,.mp4,.m4v,.mov,.avi,.ts,.m2ts,.mpg,.mpeg,.wmv'
 ).split(',') if e.strip()]
+MIN_SIZE_MB    = int(os.environ.get('MIN_SIZE_MB', '50'))      # ignore files smaller than this
 
-MIN_SIZE_MB    = int(os.environ.get('MIN_SIZE_MB', '50'))  # ignore files smaller than this
+# --- Visibility guard knobs ---
+FAILSAFE_ENABLED           = os.environ.get('FAILSAFE_ENABLED', '1') not in ('0', 'false', 'False')
+FAILSAFE_REQUIRE_DIRS      = os.environ.get('FAILSAFE_REQUIRE_DIRS', 'any').lower()  # 'any' or 'all'
+FAILSAFE_MIN_MEDIA_FILES   = int(os.environ.get('FAILSAFE_MIN_MEDIA_FILES', '100'))  # min files indexed
+FAILSAFE_MAX_INDEX_ERRORS  = int(os.environ.get('FAILSAFE_MAX_INDEX_ERRORS', '200')) # stat/list errors cap
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
@@ -89,22 +94,16 @@ def remove_tag_http(hashes, tag):
         if _api_post('torrents/removeTags', {'hashes': '|'.join(hashes), 'tags': tag}):
             log(f"🗑 removeTags OK: removed '{tag}' from {len(hashes)} torrent(s).")
 
-# --- Seeding detection ---
+# --- Strict seeding detection ---
 def is_actively_seeding(t):
     """
-    Strict seeding detection:
-      active ONLY when state is one of:
-        uploading, forcedUP, checkingUP, queuedUP, pausedUP
-      Everything else (including stalledUP) is NOT active.
+    Active ONLY when state is one of: uploading, forcedUP, checkingUP, queuedUP.
+    Everything else (including stalledUP, pausedUP) is NOT active.
     """
-    s = (t.get('state') or '').strip()
-    if not s:
-        return False
-    s_norm = s.lower()  # normalize: 'forcedUP' -> 'forcedup'
-    active_states = {'uploading', 'forcedup', 'checkingup', 'queuedup', 'pausedup'}
-    return s_norm in active_states
+    s = (t.get('state') or '').strip().lower()
+    return s in {'uploading', 'forcedup', 'checkingup', 'queuedup'}
 
-# --- Helpers for v1.8 (nlink + content) ---
+# --- Helpers for nlink + content ---
 def is_media_candidate(path, size_bytes):
     if size_bytes < MIN_SIZE_MB * 1024 * 1024:
         return False
@@ -112,47 +111,93 @@ def is_media_candidate(path, size_bytes):
     return (ext in EXT_WHITELIST) if EXT_WHITELIST else True
 
 def quick_hash(path, block=1024*1024):
-    """Hash first and last 1MB. Fast, good enough to disambiguate same-size files."""
+    """Hash first and last 1MB. Fast, sufficient to disambiguate same-size files."""
     h = hashlib.sha1()
     try:
         sz = os.path.getsize(path)
         with open(path, 'rb') as f:
-            data = f.read(block)
-            h.update(data)
+            data = f.read(block); h.update(data)
             if sz > block:
-                try:
-                    f.seek(max(0, sz - block))
-                except OSError:
-                    pass
-                data2 = f.read(block)
-                h.update(data2)
+                try: f.seek(max(0, sz - block))
+                except OSError: pass
+                data2 = f.read(block); h.update(data2)
         return h.hexdigest()
     except Exception:
         return None
 
-def build_media_size_map():
-    """Map size -> list(paths) for media files; hashes computed lazily per candidate."""
+# --- Visibility guard + media index (size -> paths), with stats ---
+def _dir_accessible(p):
+    try:
+        if not os.path.isdir(p): return False
+        # Need both read and execute (traverse) perms
+        if not (os.access(p, os.R_OK) and os.access(p, os.X_OK)): return False
+        # Try listing a single entry to catch FUSE/permission quirks
+        with os.scandir(p) as it:
+            for _ in it:
+                break
+        return True
+    except Exception:
+        return False
+
+def build_media_size_map_with_stats():
+    """
+    Returns (size_map, stats) where:
+      size_map: {size_bytes: [paths,...]} for media candidates
+      stats: {
+        'files_count': int,
+        'dirs_ok': int,
+        'dirs_missing': [path,...],
+        'errors': int,
+        'distinct_sizes': int,
+      }
+    """
     size_map = defaultdict(list)
     files_count = 0
+    errors = 0
+    dirs_ok = 0
+    dirs_missing = []
     start = time.time()
+
     for media_dir in MEDIA_DIRS:
-        for root, _, files in os.walk(media_dir):
-            for fn in files:
-                path = os.path.join(root, fn)
-                try:
-                    st = os.stat(path)
-                except FileNotFoundError:
-                    continue
-                except Exception:
-                    continue
-                if not is_media_candidate(path, st.st_size):
-                    continue
-                size_map[st.st_size].append(path)
-                files_count += 1
+        if not _dir_accessible(media_dir):
+            dirs_missing.append(media_dir)
+            continue
+        dirs_ok += 1
+        # Walk this dir
+        try:
+            for root, _, files in os.walk(media_dir):
+                for fn in files:
+                    path = os.path.join(root, fn)
+                    try:
+                        st = os.stat(path)
+                    except FileNotFoundError:
+                        continue
+                    except Exception:
+                        errors += 1
+                        continue
+                    if not is_media_candidate(path, st.st_size):
+                        continue
+                    size_map[st.st_size].append(path)
+                    files_count += 1
+        except Exception:
+            errors += 1
+            continue
+
     secs = time.time() - start
-    log(f"📚 Media size index built: {files_count} files across {len(MEDIA_DIRS)} dir(s) in {secs:.1f}s "
-        f"({len(size_map)} distinct sizes).")
-    return size_map
+    stats = {
+        'files_count': files_count,
+        'dirs_ok': dirs_ok,
+        'dirs_missing': dirs_missing,
+        'errors': errors,
+        'distinct_sizes': len(size_map),
+        'elapsed': secs,
+    }
+    log(f"📚 Media size index: files={files_count}, sizes={len(size_map)}, "
+        f"dirs_ok={dirs_ok}/{len(MEDIA_DIRS)}, missing={len(dirs_missing)}, "
+        f"errors={errors}, in {secs:.1f}s.")
+    if dirs_missing:
+        log(f"⚠ Missing/Unreadable media dirs: {', '.join(dirs_missing)}")
+    return size_map, stats
 
 def linked_to_library(qb, t, media_size_map, media_hash_cache):
     """
@@ -177,12 +222,9 @@ def linked_to_library(qb, t, media_size_map, media_hash_cache):
 
         if not is_media_candidate(torrent_path, st.st_size):
             continue
-
-        # must be hardlinked *somewhere*
         if not st.st_nlink or st.st_nlink <= 1:
             continue
 
-        # find library candidates by size
         candidates = media_size_map.get(st.st_size)
         if not candidates:
             continue
@@ -202,76 +244,13 @@ def linked_to_library(qb, t, media_size_map, media_hash_cache):
 
     return False
 
-def run_cleanup():
-    log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)}")
-    log("Starting cleanup cycle...")
+def _visibility_is_ok(stats):
+    """
+    Decide if the media library visibility looks healthy enough to allow tag changes.
+    """
+    if not FAILSAFE_ENABLED:
+        return True, "failsafe disabled"
 
-    qb = get_qb_client()
-    if not qb:
-        log("No connection to qBittorrent, skipping this cycle.")
-        return
-
-    media_size_map = build_media_size_map()
-    media_hash_cache = {}
-
-    try:
-        torrents = qb.torrents()
-    except Exception as e:
-        log(f"Error fetching torrents: {e}")
-        return
-
-    if MAX_TORRENTS > 0:
-        torrents = torrents[:MAX_TORRENTS]
-        log(f"⚙ Limiting to first {MAX_TORRENTS} torrents (MAX_TORRENTS).")
-
-    orphan_batch, untag_batch = [], []
-
-    for i, t in enumerate(torrents, 1):
-        if i % 50 == 0:
-            log(f"…processed {i}/{len(torrents)} torrents.")
-
-        # Only consider torrents saved under DOWNLOADS_DIR
-        if not t['save_path'].startswith(DOWNLOADS_DIR):
-            continue
-
-        # NEW: exclude active seeders from any tag changes
-        if is_actively_seeding(t):
-            log(f"⏩ Skipping '{t['name']}' (actively seeding: state={t.get('state')}). Leaving tags unchanged.")
-            continue
-
-        has_orphan_tag = ORPHAN_TAG in t.get('tags', '')
-        completion_time = t.get('completion_on', 0)
-
-        # Skip unchanged orphans to save time
-        if has_orphan_tag and completion_time == last_checked_completion_time.get(t['hash']):
-            continue
-
-        linked = linked_to_library(qb, t, media_size_map, media_hash_cache)
-
-        if not linked:
-            orphan_batch.append(t['hash'])
-            if len(orphan_batch) >= BATCH_SIZE:
-                add_tag_http(orphan_batch, ORPHAN_TAG)
-                orphan_batch.clear()
-        else:
-            if has_orphan_tag:
-                untag_batch.append(t['hash'])
-                if len(untag_batch) >= BATCH_SIZE:
-                    remove_tag_http(untag_batch, ORPHAN_TAG)
-                    untag_batch.clear()
-
-        last_checked_completion_time[t['hash']] = completion_time
-
-    # Flush remaining batches
-    if orphan_batch:
-        add_tag_http(orphan_batch, ORPHAN_TAG)
-    if untag_batch:
-        remove_tag_http(untag_batch, ORPHAN_TAG)
-
-    log("Cleanup cycle complete.")
-
-if __name__ == "__main__":
-    while True:
-        run_cleanup()
-        log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
-        time.sleep(DEBUG_INTERVAL)
+    # Require some directories to be visible
+    if FAILSAFE_REQUIRE_DIRS == 'all':
+        if stats['dirs_ok'] < len(MEDIA_D]()
