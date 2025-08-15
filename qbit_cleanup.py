@@ -92,18 +92,17 @@ def remove_tag_http(hashes, tag):
 # --- Seeding detection ---
 def is_actively_seeding(t):
     """
-    Treat as 'actively seeding' if state is any *UP* variant except pausedUP.
-    This matches qBittorrent states in 4/5.x: uploading, stalledUP, forcedUP, queuedUP, checkingUP, etc.
+    Strict seeding detection:
+      active ONLY when state is one of:
+        uploading, forcedUP, checkingUP, queuedUP, pausedUP
+      Everything else (including stalledUP) is NOT active.
     """
     s = (t.get('state') or '').strip()
     if not s:
         return False
-    if s == 'pausedUP':
-        return False
-    # Common seeding states
-    if s.endswith('UP'):
-        return True
-    return s.lower() in ('uploading', 'seeding', 'forcedup')
+    s_norm = s.lower()  # normalize: 'forcedUP' -> 'forcedup'
+    active_states = {'uploading', 'forcedup', 'checkingup', 'queuedup', 'pausedup'}
+    return s_norm in active_states
 
 # --- Helpers for v1.8 (nlink + content) ---
 def is_media_candidate(path, size_bytes):
