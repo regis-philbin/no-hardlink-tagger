@@ -6,7 +6,7 @@ import requests
 import hashlib
 from collections import defaultdict
 
-VERSION = "no-hardlink-tagger v1.8 — nlink + content"
+VERSION = "no-hardlink-tagger v1.9 — seeding-aware (nlink + content)"
 
 # --- Config from env ---
 QBITTORRENT_URL  = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
@@ -89,7 +89,23 @@ def remove_tag_http(hashes, tag):
         if _api_post('torrents/removeTags', {'hashes': '|'.join(hashes), 'tags': tag}):
             log(f"🗑 removeTags OK: removed '{tag}' from {len(hashes)} torrent(s).")
 
-# --- Helpers ---
+# --- Seeding detection ---
+def is_actively_seeding(t):
+    """
+    Treat as 'actively seeding' if state is any *UP* variant except pausedUP.
+    This matches qBittorrent states in 4/5.x: uploading, stalledUP, forcedUP, queuedUP, checkingUP, etc.
+    """
+    s = (t.get('state') or '').strip()
+    if not s:
+        return False
+    if s == 'pausedUP':
+        return False
+    # Common seeding states
+    if s.endswith('UP'):
+        return True
+    return s.lower() in ('uploading', 'seeding', 'forcedup')
+
+# --- Helpers for v1.8 (nlink + content) ---
 def is_media_candidate(path, size_bytes):
     if size_bytes < MIN_SIZE_MB * 1024 * 1024:
         return False
@@ -102,10 +118,8 @@ def quick_hash(path, block=1024*1024):
     try:
         sz = os.path.getsize(path)
         with open(path, 'rb') as f:
-            # first block
             data = f.read(block)
             h.update(data)
-            # last block (if big enough)
             if sz > block:
                 try:
                     f.seek(max(0, sz - block))
@@ -118,7 +132,7 @@ def quick_hash(path, block=1024*1024):
         return None
 
 def build_media_size_map():
-    """Map size -> list(paths) for media files; we compute quick hashes lazily per candidate."""
+    """Map size -> list(paths) for media files; hashes computed lazily per candidate."""
     size_map = defaultdict(list)
     files_count = 0
     start = time.time()
@@ -162,26 +176,22 @@ def linked_to_library(qb, t, media_size_map, media_hash_cache):
         except Exception:
             continue
 
-        # Only consider real media-like files
         if not is_media_candidate(torrent_path, st.st_size):
             continue
 
-        # Must be a hardlink to *somewhere* first
+        # must be hardlinked *somewhere*
         if not st.st_nlink or st.st_nlink <= 1:
             continue
 
-        # Look up candidates in the library by size
+        # find library candidates by size
         candidates = media_size_map.get(st.st_size)
         if not candidates:
-            # No library file with same size -> treat as not linked to library
             continue
 
-        # Compute torrent file's quick hash
         tqh = quick_hash(torrent_path)
         if not tqh:
             continue
 
-        # Try to find any library path with same quick hash
         for lib_path in candidates:
             if lib_path in media_hash_cache:
                 lqh = media_hash_cache[lib_path]
@@ -189,7 +199,7 @@ def linked_to_library(qb, t, media_size_map, media_hash_cache):
                 lqh = quick_hash(lib_path)
                 media_hash_cache[lib_path] = lqh
             if lqh and lqh == tqh:
-                return True  # confirmed linked to something in MEDIA_DIRS
+                return True  # confirmed match in MEDIA_DIRS
 
     return False
 
@@ -202,7 +212,6 @@ def run_cleanup():
         log("No connection to qBittorrent, skipping this cycle.")
         return
 
-    # Build media index once, hash cache shared within this run
     media_size_map = build_media_size_map()
     media_hash_cache = {}
 
@@ -226,10 +235,15 @@ def run_cleanup():
         if not t['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
+        # NEW: exclude active seeders from any tag changes
+        if is_actively_seeding(t):
+            log(f"⏩ Skipping '{t['name']}' (actively seeding: state={t.get('state')}). Leaving tags unchanged.")
+            continue
+
         has_orphan_tag = ORPHAN_TAG in t.get('tags', '')
         completion_time = t.get('completion_on', 0)
 
-        # Skip unchanged orphans
+        # Skip unchanged orphans to save time
         if has_orphan_tag and completion_time == last_checked_completion_time.get(t['hash']):
             continue
 
