@@ -15,9 +15,9 @@ services:
       - ORPHAN_TAG=NoMediaLink
       - DOWNLOADS_DIR=/media/downloads
       - MEDIA_DIRS=/media/movies,/media/tv
-      - DEBUG_INTERVAL=3600   # Time in seconds between cleanup cycles
+      - DEBUG_INTERVAL=10   # Time in seconds between cleanup cycles
       - BATCH_SIZE=100
-      - MAX_TORRENTS=0
+      - MAX_TORRENTS=100
       - MIN_SIZE_MB=50
       - EXT_WHITELIST=.mkv,.mp4,.m4v,.mov,.avi
     volumes:
