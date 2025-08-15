@@ -253,4 +253,97 @@ def _visibility_is_ok(stats):
 
     # Require some directories to be visible
     if FAILSAFE_REQUIRE_DIRS == 'all':
-        if stats['dirs_ok'] < len(MEDIA_D]()
+        if stats['dirs_ok'] < len(MEDIA_DIRS):
+            return False, f"not all media dirs accessible ({stats['dirs_ok']}/{len(MEDIA_DIRS)})"
+    else:  # 'any'
+        if stats['dirs_ok'] == 0:
+            return False, "no media dirs accessible"
+
+    # Require a minimum number of files indexed
+    if stats['files_count'] < FAILSAFE_MIN_MEDIA_FILES:
+        return False, f"too few media files indexed ({stats['files_count']} < {FAILSAFE_MIN_MEDIA_FILES})"
+
+    # Error budget
+    if stats['errors'] > FAILSAFE_MAX_INDEX_ERRORS:
+        return False, f"too many indexing errors ({stats['errors']} > {FAILSAFE_MAX_INDEX_ERRORS})"
+
+    return True, "ok"
+
+def run_cleanup():
+    log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)}")
+    log("Starting cleanup cycle...")
+
+    qb = get_qb_client()
+    if not qb:
+        log("No connection to qBittorrent, skipping this cycle.")
+        return
+
+    media_size_map, vis_stats = build_media_size_map_with_stats()
+    vis_ok, vis_reason = _visibility_is_ok(vis_stats)
+    if not vis_ok:
+        log(f"🛑 FAILSAFE: Library visibility not healthy ({vis_reason}). "
+            f"**No tag changes will be made this cycle.**")
+        return
+
+    try:
+        torrents = qb.torrents()
+    except Exception as e:
+        log(f"Error fetching torrents: {e}")
+        return
+
+    if MAX_TORRENTS > 0:
+        torrents = torrents[:MAX_TORRENTS]
+        log(f"⚙ Limiting to first {MAX_TORRENTS} torrents (MAX_TORRENTS).")
+
+    media_hash_cache = {}
+    orphan_batch, untag_batch = [], []
+
+    for i, t in enumerate(torrents, 1):
+        if i % 50 == 0:
+            log(f"…processed {i}/{len(torrents)} torrents.")
+
+        # Only consider torrents saved under DOWNLOADS_DIR
+        if not t['save_path'].startswith(DOWNLOADS_DIR):
+            continue
+
+        # Strict: skip active seeders and leave tags alone
+        if is_actively_seeding(t):
+            log(f"⏩ Skipping '{t['name']}' (actively seeding: state={t.get('state')}). Leaving tags unchanged.")
+            continue
+
+        has_orphan_tag = ORPHAN_TAG in t.get('tags', '')
+        completion_time = t.get('completion_on', 0)
+
+        # Skip unchanged orphans to save time
+        if has_orphan_tag and completion_time == last_checked_completion_time.get(t['hash']):
+            continue
+
+        linked = linked_to_library(qb, t, media_size_map, media_hash_cache)
+
+        if not linked:
+            orphan_batch.append(t['hash'])
+            if len(orphan_batch) >= BATCH_SIZE:
+                add_tag_http(orphan_batch, ORPHAN_TAG)
+                orphan_batch.clear()
+        else:
+            if has_orphan_tag:
+                untag_batch.append(t['hash'])
+                if len(untag_batch) >= BATCH_SIZE:
+                    remove_tag_http(untag_batch, ORPHAN_TAG)
+                    untag_batch.clear()
+
+        last_checked_completion_time[t['hash']] = completion_time
+
+    # Flush remaining batches
+    if orphan_batch:
+        add_tag_http(orphan_batch, ORPHAN_TAG)
+    if untag_batch:
+        remove_tag_http(untag_batch, ORPHAN_TAG)
+
+    log("Cleanup cycle complete.")
+
+if __name__ == "__main__":
+    while True:
+        run_cleanup()
+        log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
+        time.sleep(DEBUG_INTERVAL)
