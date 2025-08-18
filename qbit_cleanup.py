@@ -6,7 +6,7 @@ import requests
 import hashlib
 from collections import defaultdict
 
-VERSION = "no-hardlink-tagger v2.0 — visibility guard + strict seeding"
+VERSION = "no-hardlink-tagger v2.1 — visibility guard + strict seeding + activity window"
 
 # --- Config from env ---
 QBITTORRENT_URL  = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
@@ -33,6 +33,9 @@ FAILSAFE_ENABLED           = os.environ.get('FAILSAFE_ENABLED', '1') not in ('0'
 FAILSAFE_REQUIRE_DIRS      = os.environ.get('FAILSAFE_REQUIRE_DIRS', 'any').lower()  # 'any' or 'all'
 FAILSAFE_MIN_MEDIA_FILES   = int(os.environ.get('FAILSAFE_MIN_MEDIA_FILES', '100'))  # min files indexed
 FAILSAFE_MAX_INDEX_ERRORS  = int(os.environ.get('FAILSAFE_MAX_INDEX_ERRORS', '200')) # stat/list errors cap
+
+# --- NEW: recent-activity grace window (minutes) ---
+ACTIVE_GRACE_MINUTES       = int(os.environ.get('ACTIVE_GRACE_MINUTES', '30'))  # 0 disables
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
@@ -94,7 +97,7 @@ def remove_tag_http(hashes, tag):
         if _api_post('torrents/removeTags', {'hashes': '|'.join(hashes), 'tags': tag}):
             log(f"🗑 removeTags OK: removed '{tag}' from {len(hashes)} torrent(s).")
 
-# --- Strict seeding detection ---
+# --- Strict seeding detection (only these count as active) ---
 def is_actively_seeding(t):
     """
     Active ONLY when state is one of: uploading, forcedUP, checkingUP, queuedUP.
@@ -102,6 +105,30 @@ def is_actively_seeding(t):
     """
     s = (t.get('state') or '').strip().lower()
     return s in {'uploading', 'forcedup', 'checkingup', 'queuedup'}
+
+# --- NEW: recent activity window based on qB 'last_activity' ---
+def is_recently_active(t, minutes):
+    """
+    Return True if torrent had activity more recent than 'minutes' ago.
+    Uses 'last_activity' when available; falls back to upspeed>0 or active seeding.
+    """
+    if minutes <= 0:
+        return False
+    now = int(time.time())
+
+    # qB API usually returns 'last_activity' as unix epoch seconds (or -1 if never)
+    la = t.get('last_activity')
+    if isinstance(la, int) and la > 0:
+        # If last activity is within the grace window, treat as recently active
+        if (now - la) < minutes * 60:
+            return True
+
+    # Fallbacks if 'last_activity' missing/unknown
+    if (t.get('upspeed') or 0) > 0:
+        return True
+    if is_actively_seeding(t):
+        return True
+    return False
 
 # --- Helpers for nlink + content ---
 def is_media_candidate(path, size_bytes):
@@ -112,7 +139,8 @@ def is_media_candidate(path, size_bytes):
 
 def quick_hash(path, block=1024*1024):
     """Hash first and last 1MB. Fast, sufficient to disambiguate same-size files."""
-    h = hashlib.sha1()
+    import hashlib as _hashlib
+    h = _hashlib.sha1()
     try:
         sz = os.path.getsize(path)
         with open(path, 'rb') as f:
@@ -125,32 +153,17 @@ def quick_hash(path, block=1024*1024):
     except Exception:
         return None
 
-# --- Visibility guard + media index (size -> paths), with stats ---
 def _dir_accessible(p):
     try:
         if not os.path.isdir(p): return False
-        # Need both read and execute (traverse) perms
         if not (os.access(p, os.R_OK) and os.access(p, os.X_OK)): return False
-        # Try listing a single entry to catch FUSE/permission quirks
         with os.scandir(p) as it:
-            for _ in it:
-                break
+            for _ in it: break
         return True
     except Exception:
         return False
 
 def build_media_size_map_with_stats():
-    """
-    Returns (size_map, stats) where:
-      size_map: {size_bytes: [paths,...]} for media candidates
-      stats: {
-        'files_count': int,
-        'dirs_ok': int,
-        'dirs_missing': [path,...],
-        'errors': int,
-        'distinct_sizes': int,
-      }
-    """
     size_map = defaultdict(list)
     files_count = 0
     errors = 0
@@ -163,7 +176,6 @@ def build_media_size_map_with_stats():
             dirs_missing.append(media_dir)
             continue
         dirs_ok += 1
-        # Walk this dir
         try:
             for root, _, files in os.walk(media_dir):
                 for fn in files:
@@ -245,32 +257,22 @@ def linked_to_library(qb, t, media_size_map, media_hash_cache):
     return False
 
 def _visibility_is_ok(stats):
-    """
-    Decide if the media library visibility looks healthy enough to allow tag changes.
-    """
     if not FAILSAFE_ENABLED:
         return True, "failsafe disabled"
-
-    # Require some directories to be visible
     if FAILSAFE_REQUIRE_DIRS == 'all':
         if stats['dirs_ok'] < len(MEDIA_DIRS):
             return False, f"not all media dirs accessible ({stats['dirs_ok']}/{len(MEDIA_DIRS)})"
-    else:  # 'any'
+    else:
         if stats['dirs_ok'] == 0:
             return False, "no media dirs accessible"
-
-    # Require a minimum number of files indexed
     if stats['files_count'] < FAILSAFE_MIN_MEDIA_FILES:
         return False, f"too few media files indexed ({stats['files_count']} < {FAILSAFE_MIN_MEDIA_FILES})"
-
-    # Error budget
     if stats['errors'] > FAILSAFE_MAX_INDEX_ERRORS:
         return False, f"too many indexing errors ({stats['errors']} > {FAILSAFE_MAX_INDEX_ERRORS})"
-
     return True, "ok"
 
 def run_cleanup():
-    log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)}")
+    log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} — ACTIVE_GRACE_MINUTES={ACTIVE_GRACE_MINUTES}")
     log("Starting cleanup cycle...")
 
     qb = get_qb_client()
@@ -281,8 +283,7 @@ def run_cleanup():
     media_size_map, vis_stats = build_media_size_map_with_stats()
     vis_ok, vis_reason = _visibility_is_ok(vis_stats)
     if not vis_ok:
-        log(f"🛑 FAILSAFE: Library visibility not healthy ({vis_reason}). "
-            f"**No tag changes will be made this cycle.**")
+        log(f"🛑 FAILSAFE: Library visibility not healthy ({vis_reason}). **No tag changes will be made this cycle.**")
         return
 
     try:
@@ -297,24 +298,25 @@ def run_cleanup():
 
     media_hash_cache = {}
     orphan_batch, untag_batch = [], []
+    skipped_recent = 0
 
     for i, t in enumerate(torrents, 1):
         if i % 50 == 0:
             log(f"…processed {i}/{len(torrents)} torrents.")
 
-        # Only consider torrents saved under DOWNLOADS_DIR
         if not t['save_path'].startswith(DOWNLOADS_DIR):
             continue
 
-        # Strict: skip active seeders and leave tags alone
-        if is_actively_seeding(t):
-            log(f"⏩ Skipping '{t['name']}' (actively seeding: state={t.get('state')}). Leaving tags unchanged.")
+        # Strict: skip actives AND skip anything with recent activity within grace window
+        if is_actively_seeding(t) or is_recently_active(t, ACTIVE_GRACE_MINUTES):
+            skipped_recent += 1
+            # Optional: uncomment to see exact reasons per torrent
+            # log(f"⏩ Skipping '{t['name']}' (state={t.get('state')}, last_activity={t.get('last_activity')}).")
             continue
 
         has_orphan_tag = ORPHAN_TAG in t.get('tags', '')
         completion_time = t.get('completion_on', 0)
 
-        # Skip unchanged orphans to save time
         if has_orphan_tag and completion_time == last_checked_completion_time.get(t['hash']):
             continue
 
@@ -334,12 +336,12 @@ def run_cleanup():
 
         last_checked_completion_time[t['hash']] = completion_time
 
-    # Flush remaining batches
     if orphan_batch:
         add_tag_http(orphan_batch, ORPHAN_TAG)
     if untag_batch:
         remove_tag_http(untag_batch, ORPHAN_TAG)
 
+    log(f"📊 Summary: skipped_recent={skipped_recent}, tagged={len(orphan_batch)==0 and 0 or 'see logs'}, untagged={len(untag_batch)==0 and 0 or 'see logs'}")
     log("Cleanup cycle complete.")
 
 if __name__ == "__main__":
