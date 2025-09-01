@@ -35,7 +35,7 @@ FAILSAFE_MIN_MEDIA_FILES   = int(os.environ.get('FAILSAFE_MIN_MEDIA_FILES', '100
 FAILSAFE_MAX_INDEX_ERRORS  = int(os.environ.get('FAILSAFE_MAX_INDEX_ERRORS', '200')) # stat/list errors cap
 
 # --- NEW: recent-activity grace window (minutes) ---
-ACTIVE_GRACE_MINUTES       = int(os.environ.get('ACTIVE_GRACE_MINUTES', '30'))  # 0 disables
+ACTIVE_GRACE_MINUTES       = int(os.environ.get('ACTIVE_GRACE_MINUTES', '90'))  # 0 disables
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
