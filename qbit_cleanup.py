@@ -1,14 +1,18 @@
 import os
 import time
+import json
+import tempfile
 from datetime import datetime
+from collections import defaultdict
 from qbittorrent import Client
 import requests
 import hashlib
-from collections import defaultdict
 
-VERSION = "no-hardlink-tagger v2.3 — visibility guard + strict seeding + activity window + active-inode shield + min completed age"
+VERSION = "no-hardlink-tagger v3.0 — cache + two-stage + budget"
 
-# --- Config from env ---
+# =========================
+# Config (env)
+# =========================
 QBITTORRENT_URL  = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
@@ -19,41 +23,43 @@ MEDIA_DIRS    = [d.strip() for d in os.environ.get('MEDIA_DIRS', '/media/movies,
 
 DEBUG_INTERVAL = int(os.environ.get('DEBUG_INTERVAL', '60'))
 BATCH_SIZE     = int(os.environ.get('BATCH_SIZE', '25'))
-MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))      # 0 = all
+MAX_TORRENTS   = int(os.environ.get('MAX_TORRENTS', '0'))  # 0 = all
 
-# Only treat these as "media files" for linkage detection
 EXT_WHITELIST  = [e.strip().lower() for e in os.environ.get(
-    'EXT_WHITELIST',
-    '.mkv,.mp4,.m4v,.mov,.avi,.ts,.m2ts,.mpg,.mpeg,.wmv'
+    'EXT_WHITELIST', '.mkv,.mp4,.m4v,.mov,.avi,.ts,.m2ts,.mpg,.mpeg,.wmv'
 ).split(',') if e.strip()]
-MIN_SIZE_MB    = int(os.environ.get('MIN_SIZE_MB', '50'))      # ignore files smaller than this
+MIN_SIZE_MB    = int(os.environ.get('MIN_SIZE_MB', '50'))
 
-# --- Visibility guard knobs ---
+# Visibility guard
 FAILSAFE_ENABLED           = os.environ.get('FAILSAFE_ENABLED', '1') not in ('0','false','False')
 FAILSAFE_REQUIRE_DIRS      = os.environ.get('FAILSAFE_REQUIRE_DIRS', 'any').lower()  # 'any' or 'all'
 FAILSAFE_MIN_MEDIA_FILES   = int(os.environ.get('FAILSAFE_MIN_MEDIA_FILES', '100'))
 FAILSAFE_MAX_INDEX_ERRORS  = int(os.environ.get('FAILSAFE_MAX_INDEX_ERRORS', '200'))
 
-# --- Activity window ---
-ACTIVE_GRACE_MINUTES       = int(os.environ.get('ACTIVE_GRACE_MINUTES', '30'))  # 0 disables
+# Activity + age
+ACTIVE_GRACE_MINUTES       = int(os.environ.get('ACTIVE_GRACE_MINUTES', '30'))
+MIN_COMPLETED_AGE_HOURS    = int(os.environ.get('MIN_COMPLETED_AGE_HOURS', '24'))
 
-# --- Active Inode Shield toggle ---
+# Active-inode shield
 ACTIVE_INODE_SHIELD        = os.environ.get('ACTIVE_INODE_SHIELD', '1') not in ('0','false','False')
 
-# --- NEW: minimum completed age (hours). Skip torrents completed more recently than this ---
-MIN_COMPLETED_AGE_HOURS    = int(os.environ.get('MIN_COMPLETED_AGE_HOURS', '24'))  # 0 disables
+# NEW: persistent cache + budget + decision TTL
+CACHE_DIR                  = os.environ.get('CACHE_DIR', '/cache')
+HASH_BUDGET_MB             = int(os.environ.get('HASH_BUDGET_MB', '1024'))  # total MiB to read this run
+DECISION_TTL_HOURS         = int(os.environ.get('DECISION_TTL_HOURS', '24')) # reuse result for unchanged torrents
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
-    def log(msg): print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}")
-    log("Error: Missing required qBittorrent environment variables.")
-    time.sleep(9999); raise SystemExit(1)
+    raise SystemExit("Missing qBittorrent env vars.")
 
-last_checked_completion_time = {}
-
+# =========================
+# Logging
+# =========================
 def log(msg):
     print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
 
-# --- qB read (list) ---
+# =========================
+# qBittorrent helpers
+# =========================
 def get_qb_client():
     try:
         qb = Client(QBITTORRENT_URL)
@@ -63,7 +69,6 @@ def get_qb_client():
         log(f"Error connecting to qBittorrent: {e}")
         return None
 
-# --- HTTP write (tags) ---
 def _api_session():
     try:
         s = requests.Session()
@@ -94,27 +99,22 @@ def _api_post(path, data):
         return False
 
 def add_tag_http(hashes, tag):
-    if not hashes:
-        return 0
-    if _api_post('torrents/addTags', {'hashes': '|'.join(hashes), 'tags': tag}):
+    if hashes and _api_post('torrents/addTags', {'hashes': '|'.join(hashes), 'tags': tag}):
         log(f"✅ addTags OK: tagged {len(hashes)} torrent(s) with '{tag}'.")
         return len(hashes)
     return 0
 
 def remove_tag_http(hashes, tag):
-    if not hashes:
-        return 0
-    if _api_post('torrents/removeTags', {'hashes': '|'.join(hashes), 'tags': tag}):
+    if hashes and _api_post('torrents/removeTags', {'hashes': '|'.join(hashes), 'tags': tag}):
         log(f"🗑 removeTags OK: removed '{tag}' from {len(hashes)} torrent(s).")
         return len(hashes)
     return 0
 
-# --- Strict seeding detection (only these count as active) ---
+# =========================
+# Activity gates
+# =========================
 def is_actively_seeding(t):
-    """
-    Active ONLY when state is one of: uploading, forcedUP, checkingUP, queuedUP.
-    Everything else (including stalledUP, pausedUP) is NOT active.
-    """
+    # Strict: only these are "active"
     s = (t.get('state') or '').strip().lower()
     return s in {'uploading', 'forcedup', 'checkingup', 'queuedup'}
 
@@ -131,47 +131,23 @@ def is_recently_active(t, minutes):
         return True
     return False
 
-# --- NEW: minimum completed age gate ---
 def is_too_new(t, hours):
-    """
-    Return True if torrent completed less than 'hours' ago.
-    If 'completion_on' is missing/0 (not completed / unknown), treat as 'too new' for safety.
-    """
     if hours <= 0:
         return False
     co = t.get('completion_on')
     if not isinstance(co, int) or co <= 0:
         return True
-    now = int(time.time())
-    return (now - co) < hours * 3600
+    return (int(time.time()) - co) < hours * 3600
 
-# --- Media candidate + quick hash ---
+# =========================
+# Filesystem helpers
+# =========================
 def is_media_candidate(path, size_bytes):
     if size_bytes < MIN_SIZE_MB * 1024 * 1024:
         return False
     ext = os.path.splitext(path)[1].lower()
     return (ext in EXT_WHITELIST) if EXT_WHITELIST else True
 
-def quick_hash(path, block=1024*1024, retries=2, delay=0.2):
-    """Hash first and last 1MB with small retry to tolerate transient read/lock issues."""
-    for attempt in range(retries + 1):
-        try:
-            h = hashlib.sha1()
-            sz = os.path.getsize(path)
-            with open(path, 'rb') as f:
-                data = f.read(block); h.update(data)
-                if sz > block:
-                    try: f.seek(max(0, sz - block))
-                    except OSError: pass
-                    data2 = f.read(block); h.update(data2)
-            return h.hexdigest()
-        except Exception:
-            if attempt < retries:
-                time.sleep(delay)
-            else:
-                return None
-
-# --- Visibility guard + media index (size -> paths), with stats ---
 def _dir_accessible(p):
     try:
         if not os.path.isdir(p): return False
@@ -182,52 +158,105 @@ def _dir_accessible(p):
     except Exception:
         return False
 
-def build_media_size_map_with_stats():
-    size_map = defaultdict(list)
+# =========================
+# JSON cache helpers
+# =========================
+def _ensure_dir(p):
+    try:
+        os.makedirs(p, exist_ok=True)
+        return True
+    except Exception:
+        return False
+
+def _load_json(path, default):
+    try:
+        with open(path, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+def _atomic_save_json(path, data):
+    tmp = f"{path}.tmp"
+    with open(tmp, 'w') as f:
+        json.dump(data, f, separators=(',', ':'), ensure_ascii=False)
+    os.replace(tmp, path)
+
+# =========================
+# Hash budget
+# =========================
+class Budget:
+    def __init__(self, mib):
+        self.total = int(mib) * 1024 * 1024
+        self.remaining = self.total
+        self.exhausted = False
+    def need(self, nbytes):
+        if self.remaining >= nbytes:
+            self.remaining -= nbytes
+            return True
+        self.exhausted = True
+        return False
+
+def quick_hash_budgeted(path, budget, block=1024*1024):
+    try:
+        sz = os.path.getsize(path)
+        need = min(block, sz) + (block if sz > block else 0)
+        if not budget.need(need):
+            return None
+        h = hashlib.sha1()
+        with open(path, 'rb') as f:
+            data = f.read(min(block, sz)); h.update(data)
+            if sz > block:
+                try: f.seek(max(0, sz - block))
+                except OSError: pass
+                data2 = f.read(block); h.update(data2)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+# =========================
+# Stage 0: visibility guard
+# =========================
+def build_media_visibility_stats():
     files_count = 0
     errors = 0
     dirs_ok = 0
     dirs_missing = []
     start = time.time()
-
     for media_dir in MEDIA_DIRS:
         if not _dir_accessible(media_dir):
-            dirs_missing.append(media_dir); continue
+            dirs_missing.append(media_dir)
+            continue
         dirs_ok += 1
         try:
-            for root, _, files in os.walk(media_dir):
-                for fn in files:
-                    path = os.path.join(root, fn)
-                    try:
-                        st = os.stat(path)
-                    except FileNotFoundError:
-                        continue
-                    except Exception:
-                        errors += 1; continue
-                    if not is_media_candidate(path, st.st_size):
-                        continue
-                    size_map[st.st_size].append(path)
-                    files_count += 1
+            for _, _, files in os.walk(media_dir):
+                files_count += len(files)
         except Exception:
-            errors += 1; continue
-
+            errors += 1
+            continue
     secs = time.time() - start
     stats = {
         'files_count': files_count,
         'dirs_ok': dirs_ok,
         'dirs_missing': dirs_missing,
         'errors': errors,
-        'distinct_sizes': len(size_map),
         'elapsed': secs,
     }
-    log(f"📚 Media size index: files={files_count}, sizes={len(size_map)}, "
-        f"dirs_ok={dirs_ok}/{len(MEDIA_DIRS)}, missing={len(dirs_missing)}, "
-        f"errors={errors}, in {secs:.1f}s.")
+    log(f"📁 Library visibility: files~{files_count}, dirs_ok={dirs_ok}/{len(MEDIA_DIRS)}, "
+        f"missing={len(dirs_missing)}, errors={errors}, in {secs:.1f}s.")
     if dirs_missing:
         log(f"⚠ Missing/Unreadable media dirs: {', '.join(dirs_missing)}")
-    return size_map, stats
+    ok = True
+    if FAILSAFE_ENABLED:
+        if (FAILSAFE_REQUIRE_DIRS == 'all' and dirs_ok < len(MEDIA_DIRS)) or \
+           (FAILSAFE_REQUIRE_DIRS == 'any' and dirs_ok == 0) or \
+           (files_count < FAILSAFE_MIN_MEDIA_FILES) or \
+           (errors > FAILSAFE_MAX_INDEX_ERRORS):
+            ok = False
+    return ok, stats
 
-# --- Active Inode Shield ---
+# =========================
+# Stage 1: enumerate torrents, filter & collect wanted sizes
+# =========================
 def build_active_inode_shield(qb, torrents):
     shield = set()
     protected = 0
@@ -247,88 +276,292 @@ def build_active_inode_shield(qb, torrents):
             except Exception:
                 continue
             if is_media_candidate(p, st.st_size):
-                shield.add((st.st_dev, st.st_ino))
-                protected += 1
+                shield.add((st.st_dev, st.st_ino)); protected += 1
     if shield:
-        log(f"🛡 Active inode shield: {len(shield)} unique files from {protected} media entries across active/recent torrents.")
+        log(f"🛡 Active inode shield: {len(shield)} unique files from {protected} media entries.")
     else:
         log("🛡 Active inode shield: empty.")
     return shield
 
-def linked_to_library(qb, t, media_size_map, media_hash_cache):
+def collect_torrent_candidates(qb, torrents, active_shield):
     """
-    Returns True if ANY qualifying torrent file:
-      - has st_nlink > 1 (i.e., is hardlinked somewhere), AND
-      - content-matches (size + quick hash) at least one file under MEDIA_DIRS.
-    Returns False if no match; None if reads were inconclusive.
+    Returns:
+      wanted_sizes: set of sizes we must index in MEDIA_DIRS
+      t_candidates: {hash: [{'path':..., 'size':..., 'dev':..., 'ino':..., 'nlink':...}, ...]}
+      meta: counters
     """
-    try:
-        files = qb.get_torrent_files(t['hash'])
-    except Exception as e:
-        log(f"⚠ Could not fetch files for '{t['name']}': {e}")
-        files = []
+    wanted_sizes = set()
+    t_candidates = {}
+    skipped_active = skipped_recent = skipped_min_age = skipped_shield = 0
+    for t in torrents:
+        if not t['save_path'].startswith(DOWNLOADS_DIR):
+            continue
+        if is_actively_seeding(t):
+            skipped_active += 1; continue
+        if is_recently_active(t, ACTIVE_GRACE_MINUTES):
+            skipped_recent += 1; continue
+        if is_too_new(t, MIN_COMPLETED_AGE_HOURS):
+            skipped_min_age += 1; continue
 
-    for fi in files:
-        torrent_path = os.path.join(t['save_path'], fi['name'])
         try:
-            st = os.stat(torrent_path)
-        except FileNotFoundError:
-            continue
+            files = qb.get_torrent_files(t['hash'])
         except Exception:
+            files = []
+
+        cand_list = []
+        shield_hit = False
+        for fi in files:
+            p = os.path.join(t['save_path'], fi['name'])
+            try:
+                st = os.stat(p)
+            except Exception:
+                continue
+            if not is_media_candidate(p, st.st_size):
+                continue
+            if ACTIVE_INODE_SHIELD and (st.st_dev, st.st_ino) in active_shield:
+                shield_hit = True; break
+            if st.st_nlink and st.st_nlink > 1:
+                cand_list.append({'path': p, 'size': st.st_size, 'dev': st.st_dev,
+                                  'ino': st.st_ino, 'nlink': st.st_nlink})
+                wanted_sizes.add(st.st_size)
+
+        if shield_hit:
+            skipped_shield += 1
             continue
 
-        if not is_media_candidate(torrent_path, st.st_size):
+        if cand_list:
+            t_candidates[t['hash']] = cand_list
+
+    meta = dict(skipped_active=skipped_active,
+                skipped_recent=skipped_recent,
+                skipped_min_age=skipped_min_age,
+                skipped_shield=skipped_shield)
+    return wanted_sizes, t_candidates, meta
+
+# =========================
+# Stage 2: build media signature set with persistent cache
+# =========================
+def build_media_signature_set(wanted_sizes, budget):
+    """
+    Returns:
+      sig_set: set of (size, quickhash)
+      index_stats: dict with counts/timings + index_complete flag
+      cache_updated: bool
+    """
+    sig_set = set()
+    files_seen = set()
+    hashed_new = 0
+    cached_hits = 0
+    errors = 0
+    start = time.time()
+
+    cache_ok = _ensure_dir(CACHE_DIR)
+    media_cache_path = os.path.join(CACHE_DIR, 'media_hashes.json') if cache_ok else None
+    media_cache = _load_json(media_cache_path, {"entries": {}}) if media_cache_path else {"entries": {}}
+
+    entries = media_cache.get("entries", {})
+
+    # Walk only wanted sizes
+    for media_dir in MEDIA_DIRS:
+        if not _dir_accessible(media_dir):
             continue
-        if not st.st_nlink or st.st_nlink <= 1:
+        for root, _, files in os.walk(media_dir):
+            for fn in files:
+                path = os.path.join(root, fn)
+                try:
+                    st = os.stat(path)
+                except Exception:
+                    errors += 1; continue
+                sz = st.st_size
+                if sz not in wanted_sizes:
+                    continue
+                if not is_media_candidate(path, sz):
+                    continue
+
+                key = path
+                files_seen.add(key)
+                ent = entries.get(key)
+                # cache valid?
+                if ent and ent.get('size') == sz and ent.get('mtime') == int(st.st_mtime) \
+                   and ent.get('ino') == st.st_ino and ent.get('dev') == st.st_dev \
+                   and ent.get('qhash'):
+                    sig_set.add((sz, ent['qhash'])); cached_hits += 1
+                    continue
+
+                # compute quickhash (budgeted)
+                qh = quick_hash_budgeted(path, budget)
+                if not qh:
+                    # no hash -> cannot include in signature set
+                    continue
+                hashed_new += 1
+                entries[key] = {
+                    'size': sz, 'mtime': int(st.st_mtime),
+                    'ino': st.st_ino, 'dev': st.st_dev, 'qhash': qh
+                }
+                sig_set.add((sz, qh))
+
+    # prune removed files from cache
+    removed = 0
+    if entries:
+        for k in list(entries.keys()):
+            if k not in files_seen and entries[k].get('size') in wanted_sizes:
+                entries.pop(k, None); removed += 1
+
+    media_cache['entries'] = entries
+    cache_updated = False
+    if media_cache_path:
+        try:
+            _atomic_save_json(media_cache_path, media_cache)
+            cache_updated = True
+        except Exception:
+            pass
+
+    secs = time.time() - start
+    index_complete = not budget.exhausted  # if budget ran out, we might have missed hashes
+    index_stats = {
+        'sig_count': len(sig_set),
+        'cached_hits': cached_hits,
+        'hashed_new': hashed_new,
+        'cache_pruned': removed,
+        'errors': errors,
+        'elapsed': secs,
+        'index_complete': index_complete,
+        'budget_used_mb': (budget.total - budget.remaining) // (1024*1024),
+        'budget_total_mb': budget.total // (1024*1024),
+    }
+    log(f"🔎 Media signatures: sigs={len(sig_set)}, cached={cached_hits}, new_hashes={hashed_new}, "
+        f"pruned={removed}, errors={errors}, in {secs:.1f}s, budget={index_stats['budget_used_mb']}/{index_stats['budget_total_mb']} MiB.")
+    if not index_complete:
+        log("⚠ Signature index incomplete (hash budget exhausted). Will skip tagging where a signature match is required.")
+    return sig_set, index_stats, cache_updated
+
+# =========================
+# Decision cache (per torrent)
+# =========================
+def load_torrent_cache():
+    path = os.path.join(CACHE_DIR, 'torrent_state.json') if _ensure_dir(CACHE_DIR) else None
+    return path, _load_json(path, {})
+
+def save_torrent_cache(path, data):
+    try:
+        _atomic_save_json(path, data)
+    except Exception:
+        pass
+
+def can_reuse_decision(t, tstate):
+    if DECISION_TTL_HOURS <= 0:
+        return False
+    h = t.get('hash')
+    entry = tstate.get(h)
+    if not entry:
+        return False
+    # unchanged?
+    if entry.get('completion_on') != t.get('completion_on'):
+        return False
+    if entry.get('save_path') != t.get('save_path'):
+        return False
+    # TTL
+    if int(time.time()) - entry.get('decided_at', 0) > DECISION_TTL_HOURS * 3600:
+        return False
+    # reuse: don't change tags this cycle
+    return True
+
+def remember_decision(t, tstate, decision):
+    tstate[t['hash']] = {
+        'completion_on': t.get('completion_on'),
+        'save_path': t.get('save_path'),
+        'decision': decision,  # 'linked' or 'orphan'
+        'decided_at': int(time.time()),
+    }
+
+# =========================
+# Evaluate torrents with sig set
+# =========================
+def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate):
+    orphan_batch, untag_batch = [], []
+    total_tagged = total_untagged = 0
+    skipped_reuse = skipped_inconclusive = 0
+
+    for i, t in enumerate(torrents, 1):
+        if MAX_TORRENTS > 0 and i > MAX_TORRENTS:
+            break
+        if not t['save_path'].startswith(DOWNLOADS_DIR):
+            continue
+        h = t['hash']
+        cand_files = t_candidates.get(h)
+        if not cand_files:
+            # no eligible files -> treat as "not linked" only if we choose to; safer to require evidence
             continue
 
-        candidates = media_size_map.get(st.st_size)
-        if not candidates:
+        # decision reuse?
+        if can_reuse_decision(t, tstate):
+            skipped_reuse += 1
             continue
 
-        tqh = quick_hash(torrent_path)
-        if not tqh:
-            return None  # inconclusive
+        # If our media signatures are incomplete, be conservative: skip
+        if not index_complete:
+            skipped_inconclusive += 1
+            continue
 
-        for lib_path in candidates:
-            if lib_path in media_hash_cache:
-                lqh = media_hash_cache[lib_path]
-            else:
-                lqh = quick_hash(lib_path)
-                media_hash_cache[lib_path] = lqh
-            if lqh and lqh == tqh:
-                return True  # confirmed match in MEDIA_DIRS
+        # Check each candidate torrent file: (size, qhash) in sig_set ?
+        linked = False
+        for cf in cand_files:
+            tqh = quick_hash_budgeted(cf['path'], TORRENT_HASH_BUDGET)
+            if not tqh:
+                linked = None  # inconclusive
+                break
+            if (cf['size'], tqh) in sig_set:
+                linked = True
+                break
 
-    return False
+        if linked is None:
+            skipped_inconclusive += 1
+            continue
 
-def _visibility_is_ok(stats):
-    if not FAILSAFE_ENABLED:
-        return True, "failsafe disabled"
-    if FAILSAFE_REQUIRE_DIRS == 'all':
-        if stats['dirs_ok'] < len(MEDIA_DIRS):
-            return False, f"not all media dirs accessible ({stats['dirs_ok']}/{len(MEDIA_DIRS)})"
-    else:
-        if stats['dirs_ok'] == 0:
-            return False, "no media dirs accessible"
-    if stats['files_count'] < FAILSAFE_MIN_MEDIA_FILES:
-        return False, f"too few media files indexed ({stats['files_count']} < {FAILSAFE_MIN_MEDIA_FILES})"
-    if stats['errors'] > FAILSAFE_MAX_INDEX_ERRORS:
-        return False, f"too many indexing errors ({stats['errors']} > {FAILSAFE_MAX_INDEX_ERRORS})"
-    return True, "ok"
+        has_tag = ORPHAN_TAG in (t.get('tags') or '')
+        if not linked:
+            orphan_batch.append(h)
+            if len(orphan_batch) >= BATCH_SIZE:
+                total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG); orphan_batch.clear()
+            remember_decision(t, tstate, 'orphan')
+        else:
+            if has_tag:
+                untag_batch.append(h)
+                if len(untag_batch) >= BATCH_SIZE:
+                    total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG); untag_batch.clear()
+            remember_decision(t, tstate, 'linked')
+
+    if orphan_batch:
+        total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG)
+    if untag_batch:
+        total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG)
+
+    return {
+        'tagged': total_tagged,
+        'untagged': total_untagged,
+        'skipped_reuse': skipped_reuse,
+        'skipped_inconclusive': skipped_inconclusive
+    }
+
+# Single budget instance used across run (media + torrents)
+TORRENT_HASH_BUDGET = None  # will be set per run
 
 def run_cleanup():
-    log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} — ACTIVE_GRACE_MINUTES={ACTIVE_GRACE_MINUTES} — ACTIVE_INODE_SHIELD={int(ACTIVE_INODE_SHIELD)} — MIN_COMPLETED_AGE_HOURS={MIN_COMPLETED_AGE_HOURS}")
+    global TORRENT_HASH_BUDGET
+    log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} "
+        f"— ACTIVE_GRACE_MINUTES={ACTIVE_GRACE_MINUTES} — MIN_COMPLETED_AGE_HOURS={MIN_COMPLETED_AGE_HOURS} "
+        f"— ACTIVE_INODE_SHIELD={int(ACTIVE_INODE_SHIELD)} — HASH_BUDGET_MB={HASH_BUDGET_MB} "
+        f"— DECISION_TTL_HOURS={DECISION_TTL_HOURS} — CACHE_DIR={CACHE_DIR}")
     log("Starting cleanup cycle...")
 
     qb = get_qb_client()
     if not qb:
-        log("No connection to qBittorrent, skipping this cycle.")
+        log("No connection to qBittorrent, skipping.")
         return
 
-    media_size_map, vis_stats = build_media_size_map_with_stats()
-    vis_ok, vis_reason = _visibility_is_ok(vis_stats)
+    vis_ok, _ = build_media_visibility_stats()
     if not vis_ok:
-        log(f"🛑 FAILSAFE: Library visibility not healthy ({vis_reason}). **No tag changes will be made this cycle.**")
+        log("🛑 FAILSAFE: Library visibility not healthy. **No tag changes this cycle.**")
         return
 
     try:
@@ -339,92 +572,44 @@ def run_cleanup():
 
     if MAX_TORRENTS > 0:
         torrents = torrents[:MAX_TORRENTS]
-        log(f"⚙ Limiting to first {MAX_TORRENTS} torrents (MAX_TORRENTS).")
+        log(f"⚙ Limiting to first {MAX_TORRENTS} torrents.")
 
+    # Build active inode shield
     active_shield = build_active_inode_shield(qb, torrents) if ACTIVE_INODE_SHIELD else set()
 
-    media_hash_cache = {}
-    orphan_batch, untag_batch = [], []
-    skipped_active = skipped_recent = skipped_shield = skipped_min_age = skipped_inconclusive = 0
-    total_tagged = total_untagged = 0
+    # Stage 1: filter + collect wanted sizes and candidate files
+    wanted_sizes, t_candidates, meta = collect_torrent_candidates(qb, torrents, active_shield)
+    log(f"🎯 Stage1: wanted_sizes={len(wanted_sizes)}, candidates={len(t_candidates)} torrents; "
+        f"skipped_active={meta['skipped_active']}, skipped_recent={meta['skipped_recent']}, "
+        f"skipped_min_age={meta['skipped_min_age']}, shield_skips={meta['skipped_shield']}.")
 
-    for i, t in enumerate(torrents, 1):
-        if i % 50 == 0:
-            log(f"…processed {i}/{len(torrents)} torrents.")
+    # Budget: we split between media and torrents dynamically; start with full, consume as we go
+    budget = Budget(HASH_BUDGET_MB)
+    # Stage 2: build media signature set only for sizes we actually care about
+    sig_set, idx_stats, _ = build_media_signature_set(wanted_sizes, budget)
 
-        if not t['save_path'].startswith(DOWNLOADS_DIR):
-            continue
+    # Whatever remains in the budget is available for torrent quickhashes
+    TORRENT_HASH_BUDGET = budget  # pass the same budget into torrent hashing
 
-        # Strict: skip actives and recent
-        if is_actively_seeding(t):
-            skipped_active += 1
-            continue
-        if is_recently_active(t, ACTIVE_GRACE_MINUTES):
-            skipped_recent += 1
-            continue
+    # Load decision cache
+    tcache_path, tcache = load_torrent_cache()
 
-        # NEW: skip torrents completed too recently
-        if is_too_new(t, MIN_COMPLETED_AGE_HOURS):
-            skipped_min_age += 1
-            continue
+    # Stage 3: evaluate + tag using signature set
+    results = evaluate_and_tag(qb, torrents, t_candidates, sig_set, idx_stats['index_complete'], tcache)
 
-        # Shield: if any file shares inode with an active/recent torrent, skip changes
-        if active_shield:
-            try:
-                files = qb.get_torrent_files(t['hash'])
-            except Exception:
-                files = []
-            shield_hit = False
-            for fi in files:
-                p = os.path.join(t['save_path'], fi['name'])
-                try:
-                    st = os.stat(p)
-                except Exception:
-                    continue
-                if is_media_candidate(p, st.st_size) and (st.st_dev, st.st_ino) in active_shield:
-                    shield_hit = True
-                    break
-            if shield_hit:
-                skipped_shield += 1
-                continue
+    # Save decision cache
+    save_torrent_cache(tcache_path, tcache)
 
-        has_orphan_tag = ORPHAN_TAG in t.get('tags', '')
-        completion_time = t.get('completion_on', 0)
-        if has_orphan_tag and completion_time == last_checked_completion_time.get(t['hash']):
-            continue
-
-        linked = linked_to_library(qb, t, media_size_map, media_hash_cache)
-        if linked is None:
-            skipped_inconclusive += 1
-            continue
-
-        if not linked:
-            orphan_batch.append(t['hash'])
-            if len(orphan_batch) >= BATCH_SIZE:
-                total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG)
-                orphan_batch.clear()
-        else:
-            if has_orphan_tag:
-                untag_batch.append(t['hash'])
-                if len(untag_batch) >= BATCH_SIZE:
-                    total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG)
-                    untag_batch.clear()
-
-        last_checked_completion_time[t['hash']] = completion_time
-
-    if orphan_batch:
-        total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG)
-    if untag_batch:
-        total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG)
-
-    log(f"📊 Summary: tagged={total_tagged}, untagged={total_untagged}, "
-        f"skipped_active={skipped_active}, skipped_recent={skipped_recent}, "
-        f"skipped_min_age={skipped_min_age}, shield_skips={skipped_shield}, "
-        f"inconclusive_skips={skipped_inconclusive}")
+    log(f"📊 Summary: tagged={results['tagged']}, untagged={results['untagged']}, "
+        f"reuse_skips={results['skipped_reuse']}, inconclusive_skips={results['skipped_inconclusive']}, "
+        f"budget_used={idx_stats['budget_used_mb']}/{idx_stats['budget_total_mb']} MiB.")
     log("Cleanup cycle complete.")
 
 if __name__ == "__main__":
     while True:
-        run_cleanup()
+        try:
+            run_cleanup()
+        except Exception as e:
+            log(f"💥 Unhandled error: {e}")
         log(f"Waiting {DEBUG_INTERVAL} seconds before next run...")
         time.sleep(DEBUG_INTERVAL)
