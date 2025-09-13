@@ -15,13 +15,19 @@ services:
       - ORPHAN_TAG=NoMediaLink
       - DOWNLOADS_DIR=/media/downloads
       - MEDIA_DIRS=/media/movies,/media/tv
-      - DEBUG_INTERVAL=3600   # Time in seconds between cleanup cycles
+      - DEBUG_INTERVAL=7200   # Time in seconds between cleanup cycles
       - BATCH_SIZE=5
       - MAX_TORRENTS=0
-      - MIN_SIZE_MB=50
+      - MIN_SIZE_MB=300
       - EXT_WHITELIST=.mkv,.mp4,.m4v,.mov,.avi
+      - CACHE_DIR=/cache
+      - HASH_BUDGET_MB=1024         # total hashing per run (media + torrents)
+      - DECISION_TTL_HOURS=24
+      - ACTIVE_GRACE_MINUTES=30
+      - MIN_COMPLETED_AGE_HOURS=24
     volumes:
       # Mount media directories
       - /media:/media
+      - ./cache:/cache
     # Optional: use host networking if container cannot reach qBittorrent
     # network_mode: "host"
