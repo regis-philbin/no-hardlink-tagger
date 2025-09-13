@@ -21,7 +21,7 @@ services:
       - MIN_SIZE_MB=300
       - EXT_WHITELIST=.mkv,.mp4,.m4v,.mov,.avi
       - CACHE_DIR=/cache
-      - HASH_BUDGET_MB=10240         # total hashing per run (media + torrents)
+      - HASH_BUDGET_MB=102400         # total hashing per run (media + torrents)
       - DECISION_TTL_HOURS=24
       - ACTIVE_GRACE_MINUTES=30
       - MIN_COMPLETED_AGE_HOURS=24
