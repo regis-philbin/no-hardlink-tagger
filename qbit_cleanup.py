@@ -522,6 +522,8 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
 
         # Check each candidate torrent file: (size, qhash) in sig_set ?
         linked_matches = 0
+        linked_bytes = 0
+        total_bytes = sum(cf['size'] for cf in cand_files)
         inconclusive = False
         for cf in cand_files:
             tqh = quick_hash_budgeted(cf['path'], TORRENT_HASH_BUDGET)
@@ -530,13 +532,14 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
                 break
             if (cf['size'], tqh) in sig_set:
                 linked_matches += 1
+                linked_bytes += cf['size']
 
         if inconclusive:
             skipped_inconclusive += 1
             continue
 
-        coverage_pct = int((linked_matches / len(cand_files)) * 100) if cand_files else 0
-        linked_enough = linked_matches > 0 and coverage_pct >= MEDIA_LINK_MIN_PERCENT
+        coverage_pct = int((linked_bytes / total_bytes) * 100) if total_bytes > 0 else 0
+        linked_enough = linked_bytes > 0 and coverage_pct >= MEDIA_LINK_MIN_PERCENT
 
         # Optional coverage tags (best matching threshold)
         coverage_tag = None
