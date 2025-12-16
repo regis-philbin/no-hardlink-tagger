@@ -29,6 +29,20 @@ EXT_WHITELIST  = [e.strip().lower() for e in os.environ.get(
     'EXT_WHITELIST', '.mkv,.mp4,.m4v,.mov,.avi,.ts,.m2ts,.mpg,.mpeg,.wmv'
 ).split(',') if e.strip()]
 MIN_SIZE_MB    = int(os.environ.get('MIN_SIZE_MB', '50'))
+MEDIA_LINK_MIN_PERCENT = max(0, min(100, int(os.environ.get('MEDIA_LINK_MIN_PERCENT', '1'))))
+
+MEDIA_LINK_TAG_PREFIX = os.environ.get('MEDIA_LINK_TAG_PREFIX', 'MediaLink-')
+MEDIA_LINK_TAG_STEPS = []
+for _pct in os.environ.get('MEDIA_LINK_TAG_STEPS', '').split(','):
+    if not _pct.strip():
+        continue
+    try:
+        val = int(_pct)
+        if 0 < val <= 100:
+            MEDIA_LINK_TAG_STEPS.append(val)
+    except ValueError:
+        continue
+MEDIA_LINK_TAG_STEPS = sorted(set(MEDIA_LINK_TAG_STEPS))
 
 # Visibility guard
 FAILSAFE_ENABLED           = os.environ.get('FAILSAFE_ENABLED', '1') not in ('0','false','False')
@@ -482,6 +496,9 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
     total_tagged = total_untagged = 0
     skipped_reuse = skipped_inconclusive = 0
 
+    coverage_add = defaultdict(list)  # tag -> [hashes]
+    coverage_remove = defaultdict(list)  # tag -> [hashes]
+
     for i, t in enumerate(torrents, 1):
         if MAX_TORRENTS > 0 and i > MAX_TORRENTS:
             break
@@ -504,22 +521,43 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
             continue
 
         # Check each candidate torrent file: (size, qhash) in sig_set ?
-        linked = False
+        linked_matches = 0
+        inconclusive = False
         for cf in cand_files:
             tqh = quick_hash_budgeted(cf['path'], TORRENT_HASH_BUDGET)
             if not tqh:
-                linked = None  # inconclusive
+                inconclusive = True
                 break
             if (cf['size'], tqh) in sig_set:
-                linked = True
-                break
+                linked_matches += 1
 
-        if linked is None:
+        if inconclusive:
             skipped_inconclusive += 1
             continue
 
+        coverage_pct = int((linked_matches / len(cand_files)) * 100) if cand_files else 0
+        linked_enough = linked_matches > 0 and coverage_pct >= MEDIA_LINK_MIN_PERCENT
+
+        # Optional coverage tags (best matching threshold)
+        coverage_tag = None
+        if MEDIA_LINK_TAG_STEPS:
+            for step in MEDIA_LINK_TAG_STEPS:
+                if coverage_pct >= step:
+                    coverage_tag = f"{MEDIA_LINK_TAG_PREFIX}{step}%"
+                else:
+                    break
+
+        existing_tags = set((t.get('tags') or '').split(',')) if t.get('tags') else set()
+        coverage_tags_present = {tag for tag in existing_tags if tag.startswith(MEDIA_LINK_TAG_PREFIX)}
+
+        if coverage_tag and coverage_tag not in existing_tags:
+            coverage_add[coverage_tag].append(h)
+        for tag in coverage_tags_present:
+            if tag != coverage_tag:
+                coverage_remove[tag].append(h)
+
         has_tag = ORPHAN_TAG in (t.get('tags') or '')
-        if not linked:
+        if not linked_enough:
             orphan_batch.append(h)
             if len(orphan_batch) >= BATCH_SIZE:
                 total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG); orphan_batch.clear()
@@ -536,6 +574,12 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
     if untag_batch:
         total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG)
 
+    # Apply coverage tags
+    for tag, hashes in coverage_add.items():
+        add_tag_http(hashes, tag)
+    for tag, hashes in coverage_remove.items():
+        remove_tag_http(hashes, tag)
+
     return {
         'tagged': total_tagged,
         'untagged': total_untagged,
@@ -551,7 +595,10 @@ def run_cleanup():
     log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} "
         f"— ACTIVE_GRACE_MINUTES={ACTIVE_GRACE_MINUTES} — MIN_COMPLETED_AGE_HOURS={MIN_COMPLETED_AGE_HOURS} "
         f"— ACTIVE_INODE_SHIELD={int(ACTIVE_INODE_SHIELD)} — HASH_BUDGET_MB={HASH_BUDGET_MB} "
-        f"— DECISION_TTL_HOURS={DECISION_TTL_HOURS} — CACHE_DIR={CACHE_DIR}")
+        f"— DECISION_TTL_HOURS={DECISION_TTL_HOURS} — CACHE_DIR={CACHE_DIR} "
+        f"— MEDIA_LINK_MIN_PERCENT={MEDIA_LINK_MIN_PERCENT} "
+        f"— MEDIA_LINK_TAG_STEPS={MEDIA_LINK_TAG_STEPS if MEDIA_LINK_TAG_STEPS else 'disabled'} "
+        f"— MEDIA_LINK_TAG_PREFIX='{MEDIA_LINK_TAG_PREFIX}'")
     log("Starting cleanup cycle...")
 
     qb = get_qb_client()
