@@ -15,9 +15,9 @@ import uuid
 
 VERSION = "no-hardlink-tagger v3.0 — cache + two-stage + budget"
 
-# =========================
+# -------------------------
 # Config (env)
-# =========================
+# -------------------------
 QBITTORRENT_URL  = os.environ.get('QBITTORRENT_URL', '').rstrip('/')
 QBITTORRENT_USER = os.environ.get('QBITTORRENT_USER')
 QBITTORRENT_PASS = os.environ.get('QBITTORRENT_PASS')
@@ -85,12 +85,9 @@ else:
     VERIFY_ENABLED = _verify_enabled_env.lower() not in ('0', 'false', 'no')
 VERIFY_INTERVAL_SECONDS    = int(os.environ.get('VERIFY_INTERVAL_SECONDS', '3600'))
 
-if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
-    raise SystemExit("Missing qBittorrent env vars.")
-
-# =========================
+# -------------------------
 # Logging
-# =========================
+# -------------------------
 def _timestamp():
     now = datetime.now()
     if LOG_USE_AMPM:
@@ -151,9 +148,9 @@ def log_actions(entries):
             log(f"⚠️ action log write failed: {e}")
             _last_action_log_warn = now
 
-# =========================
+# -------------------------
 # qBittorrent helpers
-# =========================
+# -------------------------
 def get_qb_client():
     try:
         qb = Client(QBITTORRENT_URL)
@@ -204,9 +201,9 @@ def remove_tag_http(hashes, tag):
         return len(hashes)
     return 0
 
-# =========================
+# -------------------------
 # Activity gates
-# =========================
+# -------------------------
 def is_actively_seeding(t):
     # Strict: only these are "active"
     s = (t.get('state') or '').strip().lower()
@@ -233,9 +230,9 @@ def is_too_new(t, hours):
         return True
     return (int(time.time()) - co) < hours * 3600
 
-# =========================
+# -------------------------
 # Filesystem helpers
-# =========================
+# -------------------------
 def is_media_candidate(path, size_bytes):
     if size_bytes < MIN_SIZE_MB * 1024 * 1024:
         return False
@@ -262,9 +259,9 @@ def _dir_fingerprint(path, entry_count=None):
     except Exception:
         return None
 
-# =========================
+# -------------------------
 # JSON cache helpers
-# =========================
+# -------------------------
 def _ensure_dir(p):
     try:
         os.makedirs(p, exist_ok=True)
@@ -286,9 +283,9 @@ def _atomic_save_json(path, data):
     os.replace(tmp, path)
 
 
-# =========================
+# -------------------------
 # SQLite persistence
-# =========================
+# -------------------------
 class AssessmentDB:
     def __init__(self, path):
         self.path = path
@@ -631,9 +628,9 @@ class AssessmentDB:
             return []
 
 
-# =========================
+# -------------------------
 # Verification worker
-# =========================
+# -------------------------
 class VerificationScheduler:
     def __init__(self, db):
         self.db = db
@@ -689,9 +686,9 @@ class VerificationScheduler:
         return thread
 
 
-# =========================
+# -------------------------
 # Web UI
-# =========================
+# -------------------------
 WEB_UI_HTML = """<!DOCTYPE html>
 <html lang=\"en\">
 <head>
@@ -953,9 +950,9 @@ def start_web_ui(db, verifier):
     return server
 
 
-# =========================
+# -------------------------
 # Hash budget
-# =========================
+# -------------------------
 class Budget:
     def __init__(self, mib):
         self.total = int(mib) * 1024 * 1024
@@ -985,9 +982,9 @@ def quick_hash_budgeted(path, budget, block=1024*1024):
     except Exception:
         return None
 
-# =========================
+# -------------------------
 # Stage 0: visibility guard
-# =========================
+# -------------------------
 def build_media_visibility_stats():
     files_count = 0
     errors = 0
@@ -1026,9 +1023,9 @@ def build_media_visibility_stats():
             ok = False
     return ok, stats
 
-# =========================
+# -------------------------
 # Stage 1: enumerate torrents, filter & collect wanted sizes
-# =========================
+# -------------------------
 def build_active_inode_shield(qb, torrents):
     shield = set()
     protected = 0
@@ -1110,9 +1107,9 @@ def collect_torrent_candidates(qb, torrents, active_shield):
                 skipped_shield=skipped_shield)
     return wanted_sizes, t_candidates, meta
 
-# =========================
+# -------------------------
 # Stage 2: build media signature set with persistent cache
-# =========================
+# -------------------------
 def build_media_signature_set(wanted_sizes, budget):
     """
     Returns:
@@ -1230,9 +1227,9 @@ def build_media_signature_set(wanted_sizes, budget):
         log("⚠ Signature index incomplete (hash budget exhausted). Will skip tagging where a signature match is required.")
     return sig_set, index_stats, cache_updated
 
-# =========================
+# -------------------------
 # Decision cache (per torrent)
-# =========================
+# -------------------------
 def load_torrent_cache():
     path = os.path.join(CACHE_DIR, 'torrent_state.json') if _ensure_dir(CACHE_DIR) else None
     raw = _load_json(path, {}) if path else {}
@@ -1311,9 +1308,9 @@ def remember_decision(t, tstate, decision, coverage_pct=None, coverage_tag=None)
         'coverage_tag': coverage_tag,
     }
 
-# =========================
+# -------------------------
 # Tag verification helpers
-# =========================
+# -------------------------
 def verify_tag_state(qb, hashes, tag, expect_present):
     successes = []
     failures = []
@@ -1435,9 +1432,9 @@ def apply_and_log_tag_changes(qb, action, tag, hashes, name_lookup, coverage_inf
         log_actions(entries)
     return len(successes)
 
-# =========================
+# -------------------------
 # Evaluate torrents with sig set
-# =========================
+# -------------------------
 def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate, torrent_lookup, run_id, assessment_rows, history_rows, assessed_at):
     orphan_batch, untag_batch = [], []
     total_tagged = total_untagged = 0
@@ -1560,6 +1557,8 @@ TORRENT_HASH_BUDGET = None  # will be set per run
 
 def run_cleanup(db=None):
     global TORRENT_HASH_BUDGET
+    if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
+        raise SystemExit("Missing qBittorrent env vars.")
     run_id = uuid.uuid4().hex
     assessed_at = iso_utcnow()
     log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} "
