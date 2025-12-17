@@ -7,6 +7,7 @@ from collections import defaultdict
 from qbittorrent import Client
 import requests
 import hashlib
+import uuid
 
 VERSION = "no-hardlink-tagger v3.0 — cache + two-stage + budget"
 
@@ -64,6 +65,7 @@ DECISION_TTL_HOURS         = int(os.environ.get('DECISION_TTL_HOURS', '24')) # r
 
 # Logging style
 LOG_USE_AMPM               = os.environ.get('LOG_USE_AMPM', '0').lower() in ('1', 'true', 'yes', 'on')
+ACTION_LOG_PATH            = os.environ.get('ACTION_LOG_PATH')  # optional override; defaults to CACHE_DIR/actions.log
 
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     raise SystemExit("Missing qBittorrent env vars.")
@@ -79,6 +81,39 @@ def _timestamp():
 
 def log(msg):
     print(f"[{_timestamp()}] {msg}", flush=True)
+
+_ACTION_LOG_WARN_INTERVAL = 60  # seconds
+_last_action_log_warn = 0
+
+def _action_log_path():
+    if ACTION_LOG_PATH:
+        path = ACTION_LOG_PATH
+    else:
+        if not _ensure_dir(CACHE_DIR):
+            return None
+        path = os.path.join(CACHE_DIR, 'actions.log')
+    parent = os.path.dirname(path) or '.'
+    return path if _ensure_dir(parent) else None
+
+def log_actions(entries):
+    """
+    Persist important actions (tag/untag/coverage-tag) to a durable log.
+    Entries: list of dicts already containing timestamp strings.
+    """
+    path = _action_log_path()
+    global _last_action_log_warn
+    if not path:
+        return
+    try:
+        with open(path, 'a', encoding='utf-8') as f:
+            for entry in entries:
+                f.write(json.dumps(entry, separators=(',', ':'), ensure_ascii=False))
+                f.write('\n')
+    except Exception as e:
+        now = time.time()
+        if now - _last_action_log_warn >= _ACTION_LOG_WARN_INTERVAL:
+            log(f"⚠️ action log write failed: {e}")
+            _last_action_log_warn = now
 
 # =========================
 # qBittorrent helpers
@@ -573,12 +608,85 @@ def remember_decision(t, tstate, decision, coverage_pct=None, coverage_tag=None)
     }
 
 # =========================
+# Tag verification helpers
+# =========================
+def verify_tag_state(qb, hashes, tag, expect_present):
+    successes = []
+    failures = []
+    for h in hashes:
+        try:
+            tinfo = qb.get_torrent(h)
+        except Exception:
+            failures.append((h, 'api_error'))
+            continue
+        if not tinfo:
+            failures.append((h, 'torrent_missing'))
+            continue
+        tags = set((tinfo.get('tags') or '').split(',')) if tinfo.get('tags') else set()
+        has_tag = tag in tags
+        if has_tag == expect_present:
+            successes.append(h)
+        else:
+            failures.append((h, 'missing_tag' if not has_tag else 'unexpected_tag'))
+    return successes, failures
+
+def apply_and_log_tag_changes(qb, action, tag, hashes, name_lookup, coverage_info, run_id, seq_ref, http_func):
+    if not hashes:
+        return 0
+    http_ok = http_func(hashes, tag)
+    expect_present = action == 'tag'
+    successes, failures = verify_tag_state(qb, hashes, tag, expect_present)
+    seen = {h for h in successes}
+    seen.update(h for h, _ in failures)
+    for h in hashes:
+        if h not in seen:
+            failures.append((h, 'verify_failed' if http_ok else 'http_error'))
+    entries = []
+    for h in successes:
+        seq_ref[0] += 1
+        cov = coverage_info.get(h, {}) if coverage_info else {}
+        entries.append({
+            'ts': _timestamp(),
+            'run_id': run_id,
+            'seq': seq_ref[0],
+            'action': action,
+            'tag': tag,
+            'hash': h,
+            'name': name_lookup.get(h, {}).get('name'),
+            'coverage_pct': cov.get('coverage_pct'),
+            'coverage_tag': cov.get('coverage_tag'),
+            'success': True,
+            'error': None,
+        })
+    for h, reason in failures:
+        seq_ref[0] += 1
+        cov = coverage_info.get(h, {}) if coverage_info else {}
+        entries.append({
+            'ts': _timestamp(),
+            'run_id': run_id,
+            'seq': seq_ref[0],
+            'action': action,
+            'tag': tag,
+            'hash': h,
+            'name': name_lookup.get(h, {}).get('name'),
+            'coverage_pct': cov.get('coverage_pct'),
+            'coverage_tag': cov.get('coverage_tag'),
+            'success': False,
+            'error': reason or ('http_error' if not http_ok else 'verify_failed'),
+        })
+    if entries:
+        log_actions(entries)
+    return len(successes)
+
+# =========================
 # Evaluate torrents with sig set
 # =========================
-def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate):
+def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate, torrent_lookup, run_id):
     orphan_batch, untag_batch = [], []
     total_tagged = total_untagged = 0
     skipped_reuse = skipped_inconclusive = 0
+    seq_ref = [0]
+    coverage_info = {}
 
     coverage_add = defaultdict(list)  # tag -> [hashes]
     coverage_remove = defaultdict(list)  # tag -> [hashes]
@@ -647,26 +755,30 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
         has_tag = ORPHAN_TAG in (t.get('tags') or '')
         if not linked_enough:
             orphan_batch.append(h)
+            coverage_info[h] = {'coverage_pct': coverage_pct, 'coverage_tag': coverage_tag}
             if len(orphan_batch) >= BATCH_SIZE:
-                total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG); orphan_batch.clear()
+                total_tagged += apply_and_log_tag_changes(qb, 'tag', ORPHAN_TAG, orphan_batch, torrent_lookup, coverage_info, run_id, seq_ref, add_tag_http)
+                orphan_batch.clear()
             remember_decision(t, tstate, 'orphan', coverage_pct, coverage_tag)
         else:
             if has_tag:
                 untag_batch.append(h)
+                coverage_info[h] = {'coverage_pct': coverage_pct, 'coverage_tag': coverage_tag}
                 if len(untag_batch) >= BATCH_SIZE:
-                    total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG); untag_batch.clear()
+                    total_untagged += apply_and_log_tag_changes(qb, 'untag', ORPHAN_TAG, untag_batch, torrent_lookup, coverage_info, run_id, seq_ref, remove_tag_http)
+                    untag_batch.clear()
             remember_decision(t, tstate, 'linked', coverage_pct, coverage_tag)
 
     if orphan_batch:
-        total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG)
+        total_tagged += apply_and_log_tag_changes(qb, 'tag', ORPHAN_TAG, orphan_batch, torrent_lookup, coverage_info, run_id, seq_ref, add_tag_http)
     if untag_batch:
-        total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG)
+        total_untagged += apply_and_log_tag_changes(qb, 'untag', ORPHAN_TAG, untag_batch, torrent_lookup, coverage_info, run_id, seq_ref, remove_tag_http)
 
     # Apply coverage tags
     for tag, hashes in coverage_add.items():
-        add_tag_http(hashes, tag)
+        apply_and_log_tag_changes(qb, 'tag', tag, hashes, torrent_lookup, coverage_info, run_id, seq_ref, add_tag_http)
     for tag, hashes in coverage_remove.items():
-        remove_tag_http(hashes, tag)
+        apply_and_log_tag_changes(qb, 'untag', tag, hashes, torrent_lookup, coverage_info, run_id, seq_ref, remove_tag_http)
 
     return {
         'tagged': total_tagged,
@@ -680,6 +792,7 @@ TORRENT_HASH_BUDGET = None  # will be set per run
 
 def run_cleanup():
     global TORRENT_HASH_BUDGET
+    run_id = uuid.uuid4().hex
     log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} "
         f"— ACTIVE_GRACE_MINUTES={ACTIVE_GRACE_MINUTES} — MIN_COMPLETED_AGE_HOURS={MIN_COMPLETED_AGE_HOURS} "
         f"— ACTIVE_INODE_SHIELD={int(ACTIVE_INODE_SHIELD)} — HASH_BUDGET_MB={HASH_BUDGET_MB} "
@@ -710,6 +823,8 @@ def run_cleanup():
         torrents = torrents[:MAX_TORRENTS]
         log(f"⚙ Limiting to first {MAX_TORRENTS} torrents.")
 
+    torrent_lookup = {t['hash']: {'name': t.get('name'), 'save_path': t.get('save_path')} for t in torrents}
+
     # Build active inode shield
     active_shield = build_active_inode_shield(qb, torrents) if ACTIVE_INODE_SHIELD else set()
 
@@ -731,7 +846,7 @@ def run_cleanup():
     tcache_path, tcache = load_torrent_cache()
 
     # Stage 3: evaluate + tag using signature set
-    results = evaluate_and_tag(qb, torrents, t_candidates, sig_set, idx_stats['index_complete'], tcache)
+    results = evaluate_and_tag(qb, torrents, t_candidates, sig_set, idx_stats['index_complete'], tcache, torrent_lookup, run_id)
 
     # Save decision cache
     save_torrent_cache(tcache_path, tcache)
