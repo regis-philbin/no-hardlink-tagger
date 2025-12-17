@@ -172,6 +172,16 @@ def _dir_accessible(p):
     except Exception:
         return False
 
+def _dir_fingerprint(path, entry_count=None):
+    try:
+        st = os.stat(path)
+        if entry_count is None:
+            with os.scandir(path) as it:
+                entry_count = sum(1 for _ in it)
+        return max(int(st.st_mtime), int(st.st_ino), int(entry_count or 0))
+    except Exception:
+        return None
+
 # =========================
 # JSON cache helpers
 # =========================
@@ -371,15 +381,37 @@ def build_media_signature_set(wanted_sizes, budget):
 
     cache_ok = _ensure_dir(CACHE_DIR)
     media_cache_path = os.path.join(CACHE_DIR, 'media_hashes.json') if cache_ok else None
-    media_cache = _load_json(media_cache_path, {"entries": {}}) if media_cache_path else {"entries": {}}
+    media_cache = _load_json(media_cache_path, {"entries": {}, "dir_fingerprints": {}}) if media_cache_path else {"entries": {}, "dir_fingerprints": {}}
 
     entries = media_cache.get("entries", {})
+    dir_fingerprints = media_cache.get("dir_fingerprints", {})
 
     # Walk only wanted sizes
     for media_dir in MEDIA_DIRS:
         if not _dir_accessible(media_dir):
             continue
-        for root, _, files in os.walk(media_dir):
+        for root, dirs, files in os.walk(media_dir):
+            fp = _dir_fingerprint(root, entry_count=len(files) + len(dirs))
+            cached_fp = dir_fingerprints.get(root)
+            if fp is not None:
+                dir_fingerprints[root] = fp
+            if fp is not None and cached_fp is not None and fp == cached_fp and root not in files_seen:
+                prefix = root + os.sep
+                for path, ent in entries.items():
+                    if not path.startswith(prefix):
+                        continue
+                    sz = ent.get('size')
+                    qh = ent.get('qhash')
+                    if sz not in wanted_sizes or not qh:
+                        continue
+                    if not is_media_candidate(path, sz):
+                        continue
+                    files_seen.add(path)
+                    sig_set.add((sz, qh))
+                    cached_hits += 1
+                files_seen.add(root)
+                dirs[:] = []
+                continue
             for fn in files:
                 path = os.path.join(root, fn)
                 try:
@@ -422,6 +454,7 @@ def build_media_signature_set(wanted_sizes, budget):
                 entries.pop(k, None); removed += 1
 
     media_cache['entries'] = entries
+    media_cache['dir_fingerprints'] = dir_fingerprints
     cache_updated = False
     if media_cache_path:
         try:
