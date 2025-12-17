@@ -487,38 +487,80 @@ def build_media_signature_set(wanted_sizes, budget):
 # =========================
 def load_torrent_cache():
     path = os.path.join(CACHE_DIR, 'torrent_state.json') if _ensure_dir(CACHE_DIR) else None
-    return path, _load_json(path, {})
+    raw = _load_json(path, {}) if path else {}
+    current_cfg = {
+        'media_link_min_percent': MEDIA_LINK_MIN_PERCENT,
+        'media_link_tag_steps': MEDIA_LINK_TAG_STEPS,
+    }
+
+    if isinstance(raw, dict) and 'entries' in raw:
+        entries = raw.get('entries') or {}
+        cached_cfg = raw.get('config') or {}
+    elif isinstance(raw, dict):
+        entries = raw
+        cached_cfg = {}
+    else:
+        entries = {}
+        cached_cfg = {}
+
+    if cached_cfg != current_cfg and entries:
+        log("ℹ️ Torrent cache config changed, invalidating entries.")
+        entries = {}
+
+    return path, {'entries': entries, 'config': current_cfg}
 
 def save_torrent_cache(path, data):
+    if not path:
+        return
+    payload = data
+    if not isinstance(payload, dict) or 'entries' not in payload:
+        payload = {'entries': data}
+    payload.setdefault('config', {
+        'media_link_min_percent': MEDIA_LINK_MIN_PERCENT,
+        'media_link_tag_steps': MEDIA_LINK_TAG_STEPS,
+    })
     try:
-        _atomic_save_json(path, data)
+        _atomic_save_json(path, payload)
     except Exception:
         pass
 
-def can_reuse_decision(t, tstate):
+def can_reuse_decision(t, tstate, existing_tags):
     if DECISION_TTL_HOURS <= 0:
         return False
-    h = t.get('hash')
-    entry = tstate.get(h)
+    entries = tstate.get('entries', tstate)
+    entry = entries.get(t.get('hash'))
     if not entry:
         return False
-    # unchanged?
     if entry.get('completion_on') != t.get('completion_on'):
         return False
     if entry.get('save_path') != t.get('save_path'):
         return False
-    # TTL
     if int(time.time()) - entry.get('decided_at', 0) > DECISION_TTL_HOURS * 3600:
         return False
-    # reuse: don't change tags this cycle
-    return True
 
-def remember_decision(t, tstate, decision):
-    tstate[t['hash']] = {
+    coverage_tags_present = {tag for tag in existing_tags if tag.startswith(MEDIA_LINK_TAG_PREFIX)}
+    expected_coverage_tag = entry.get('coverage_tag')
+    coverage_ok = coverage_tags_present == ({expected_coverage_tag} if expected_coverage_tag else set())
+
+    decision = entry.get('decision')
+    if decision == 'orphan':
+        decision_ok = ORPHAN_TAG in existing_tags
+    elif decision == 'linked':
+        decision_ok = ORPHAN_TAG not in existing_tags
+    else:
+        decision_ok = False
+
+    return decision_ok and coverage_ok
+
+def remember_decision(t, tstate, decision, coverage_pct=None, coverage_tag=None):
+    entries = tstate.setdefault('entries', {})
+    entries[t['hash']] = {
         'completion_on': t.get('completion_on'),
         'save_path': t.get('save_path'),
         'decision': decision,  # 'linked' or 'orphan'
         'decided_at': int(time.time()),
+        'coverage_pct': coverage_pct,
+        'coverage_tag': coverage_tag,
     }
 
 # =========================
@@ -543,8 +585,10 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
             # no eligible files -> treat as "not linked" only if we choose to; safer to require evidence
             continue
 
-        # decision reuse?
-        if can_reuse_decision(t, tstate):
+        existing_tags = set((t.get('tags') or '').split(',')) if t.get('tags') else set()
+
+        # decision reuse? only if tags already reflect cached decision/coverage
+        if can_reuse_decision(t, tstate, existing_tags):
             skipped_reuse += 1
             continue
 
@@ -583,7 +627,6 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
                 else:
                     break
 
-        existing_tags = set((t.get('tags') or '').split(',')) if t.get('tags') else set()
         coverage_tags_present = {tag for tag in existing_tags if tag.startswith(MEDIA_LINK_TAG_PREFIX)}
 
         if coverage_tag and coverage_tag not in existing_tags:
@@ -597,13 +640,13 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
             orphan_batch.append(h)
             if len(orphan_batch) >= BATCH_SIZE:
                 total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG); orphan_batch.clear()
-            remember_decision(t, tstate, 'orphan')
+            remember_decision(t, tstate, 'orphan', coverage_pct, coverage_tag)
         else:
             if has_tag:
                 untag_batch.append(h)
                 if len(untag_batch) >= BATCH_SIZE:
                     total_untagged += remove_tag_http(untag_batch, ORPHAN_TAG); untag_batch.clear()
-            remember_decision(t, tstate, 'linked')
+            remember_decision(t, tstate, 'linked', coverage_pct, coverage_tag)
 
     if orphan_batch:
         total_tagged += add_tag_http(orphan_batch, ORPHAN_TAG)
