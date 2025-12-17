@@ -62,14 +62,23 @@ CACHE_DIR                  = os.environ.get('CACHE_DIR', '/cache')
 HASH_BUDGET_MB             = int(os.environ.get('HASH_BUDGET_MB', '1024'))  # total MiB to read this run
 DECISION_TTL_HOURS         = int(os.environ.get('DECISION_TTL_HOURS', '24')) # reuse result for unchanged torrents
 
+# Logging style
+LOG_USE_AMPM               = os.environ.get('LOG_USE_AMPM', '0').lower() in ('1', 'true', 'yes', 'on')
+
 if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
     raise SystemExit("Missing qBittorrent env vars.")
 
 # =========================
 # Logging
 # =========================
+def _timestamp():
+    now = datetime.now()
+    if LOG_USE_AMPM:
+        return now.strftime("%Y-%m-%d %I:%M:%S %p")
+    return now.isoformat(sep=' ', timespec='seconds')
+
 def log(msg):
-    print(f"[{datetime.now().isoformat(sep=' ', timespec='seconds')}] {msg}", flush=True)
+    print(f"[{_timestamp()}] {msg}", flush=True)
 
 # =========================
 # qBittorrent helpers
@@ -677,7 +686,8 @@ def run_cleanup():
         f"— DECISION_TTL_HOURS={DECISION_TTL_HOURS} — CACHE_DIR={CACHE_DIR} "
         f"— MEDIA_LINK_MIN_PERCENT={MEDIA_LINK_MIN_PERCENT} "
         f"— MEDIA_LINK_TAG_STEPS={MEDIA_LINK_TAG_STEPS if MEDIA_LINK_TAG_STEPS else 'disabled'} "
-        f"— MEDIA_LINK_TAG_PREFIX='{MEDIA_LINK_TAG_PREFIX}'")
+        f"— MEDIA_LINK_TAG_PREFIX='{MEDIA_LINK_TAG_PREFIX}' "
+        f"— LOG_USE_AMPM={int(LOG_USE_AMPM)}")
     log("Starting cleanup cycle...")
 
     qb = get_qb_client()
