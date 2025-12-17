@@ -67,9 +67,6 @@ DECISION_TTL_HOURS         = int(os.environ.get('DECISION_TTL_HOURS', '24')) # r
 LOG_USE_AMPM               = os.environ.get('LOG_USE_AMPM', '0').lower() in ('1', 'true', 'yes', 'on')
 ACTION_LOG_PATH            = os.environ.get('ACTION_LOG_PATH')  # optional override; defaults to CACHE_DIR/actions.log
 
-if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
-    raise SystemExit("Missing qBittorrent env vars.")
-
 # =========================
 # Logging
 # =========================
@@ -791,6 +788,9 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
 TORRENT_HASH_BUDGET = None  # will be set per run
 
 def run_cleanup():
+    if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
+        raise SystemExit("Missing qBittorrent env vars.")
+
     global TORRENT_HASH_BUDGET
     run_id = uuid.uuid4().hex
     log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} "
