@@ -94,6 +94,8 @@ All runtime configuration is provided through environment variables and can be e
 | `HASH_BUDGET_MB` | `1024` | MiB budget for hashing per run. |
 | `DECISION_TTL_HOURS` | `24` | Reuse previous decisions for unchanged torrents for this many hours. |
 
+The container will exit immediately on startup if any required qBittorrent environment variables are missing, but imports of the module remain safe for tooling that reuses shared helpers.
+
 ## Minimum media-link coverage
 You can control how much of a torrent's candidate media size must be hardlinked back to your media folders before it is considered linked. Set `MEDIA_LINK_MIN_PERCENT` (0–100) to the minimum percentage of total candidate **size** that needs to match the media library for the torrent to avoid the `NoMediaLink` tag. For example, `MEDIA_LINK_MIN_PERCENT=20` will still tag a season pack if only one 1 GB file is linked out of a 5 GB season pack.
 
