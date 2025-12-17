@@ -84,6 +84,12 @@ All runtime configuration is provided through environment variables and can be e
 | `ACTIVE_GRACE_MINUTES` | `30` | Skip tagging torrents active within this many minutes. |
 | `MIN_COMPLETED_AGE_HOURS` | `24` | Skip torrents completed within this many hours. |
 | `ACTIVE_INODE_SHIELD` | `1` | Extra protection to avoid tagging while files are mutating. |
+| `WEB_UI_ENABLED` | `0` | Enable the embedded assessments web UI and SQLite persistence. |
+| `WEB_UI_BIND` | `0.0.0.0` | Host/interface to bind the web UI server. |
+| `WEB_UI_PORT` | `8081` | Port to expose the web UI server. |
+| `ASSESSMENTS_DB_PATH` | `${CACHE_DIR}/assessments.sqlite` | Location of the persistent assessments database. |
+| `VERIFY_ENABLED` | `1` when `WEB_UI_ENABLED=1` | Enable background verification of stored torrent existence. |
+| `VERIFY_INTERVAL_SECONDS` | `3600` | Seconds between verification passes when enabled. |
 | `CACHE_DIR` | `/cache` | Location for persistent cache data. |
 | `HASH_BUDGET_MB` | `1024` | MiB budget for hashing per run. |
 | `DECISION_TTL_HOURS` | `24` | Reuse previous decisions for unchanged torrents for this many hours. |
@@ -92,3 +98,39 @@ All runtime configuration is provided through environment variables and can be e
 You can control how much of a torrent's candidate media size must be hardlinked back to your media folders before it is considered linked. Set `MEDIA_LINK_MIN_PERCENT` (0–100) to the minimum percentage of total candidate **size** that needs to match the media library for the torrent to avoid the `NoMediaLink` tag. For example, `MEDIA_LINK_MIN_PERCENT=20` will still tag a season pack if only one 1 GB file is linked out of a 5 GB season pack.
 
 Optional coverage tags can also be emitted to show the best-matching threshold a torrent met. Configure `MEDIA_LINK_TAG_STEPS` with a comma-separated list of percentages (e.g., `10,20,30`) and the script will apply tags such as `MediaLink-10%`, `MediaLink-20%`, etc., using the prefix from `MEDIA_LINK_TAG_PREFIX`.
+
+## Web UI and assessments database
+Set `WEB_UI_ENABLED=1` to start a lightweight HTTP server (default bind: `0.0.0.0:8081`) that serves a DataTables-powered assessments page and JSON endpoints. The UI shows every torrent the script has ever assessed, its most recent assessment results, existence status, and whether a removal was detected after the script successfully tagged it.
+
+### Persistence
+Assessment data is stored in SQLite at `${CACHE_DIR}/assessments.sqlite` (override with `ASSESSMENTS_DB_PATH`). Bind-mount `CACHE_DIR` (e.g., `./cache:/cache`) to keep the database and existing JSONL `actions.log` across restarts. The background verification loop revalidates torrent existence using qBittorrent and updates the UI even after torrents are removed from the client.
+
+### Example docker-compose snippet (UI enabled)
+```yaml
+version: "3.8"
+services:
+  no-hardlink-tagger:
+    image: ghcr.io/<your-ghcr-namespace>/no-hardlink-tagger:latest
+    restart: unless-stopped
+    environment:
+      QBITTORRENT_URL: "${QBITTORRENT_URL}"
+      QBITTORRENT_USER: "${QBITTORRENT_USER}"
+      QBITTORRENT_PASS: "${QBITTORRENT_PASS}"
+      CACHE_DIR: "${CACHE_DIR:-/cache}"
+      WEB_UI_ENABLED: "1"
+      WEB_UI_PORT: "8081"
+      VERIFY_INTERVAL_SECONDS: "3600"
+    ports:
+      - "8081:8081"
+    volumes:
+      - /media:/media
+      - ./cache:/cache
+```
+
+### UI overview
+- **Status header:** displays the last verification timestamp (global), total torrent count, how many still exist in qBittorrent, and how many were ever removed. A **Refresh existence now** button triggers an immediate verification pass.
+- **Table:** sortable/searchable DataTable with filters for existence, removed state, removed-after-tag state, and linked-percent min/max ranges. Columns include torrent name/hash/tracker/tags, linked percentage, cached flag (whether a cached assessment was reused), existence/removal flags, coverage tag, and last action metadata.
+
+### Removed vs. removed after tag
+- **Removed?** is set once a previously assessed torrent is no longer returned by qBittorrent.
+- **Removed after tag?** is set when a removal is detected after this script successfully applied a tag (e.g., `ORPHAN_TAG`) to the torrent, regardless of what later removed it.
