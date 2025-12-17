@@ -65,9 +65,6 @@ DECISION_TTL_HOURS         = int(os.environ.get('DECISION_TTL_HOURS', '24')) # r
 # Logging style
 LOG_USE_AMPM               = os.environ.get('LOG_USE_AMPM', '0').lower() in ('1', 'true', 'yes', 'on')
 
-if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
-    raise SystemExit("Missing qBittorrent env vars.")
-
 # =========================
 # Logging
 # =========================
@@ -679,6 +676,9 @@ def evaluate_and_tag(qb, torrents, t_candidates, sig_set, index_complete, tstate
 TORRENT_HASH_BUDGET = None  # will be set per run
 
 def run_cleanup():
+    if not all([QBITTORRENT_URL, QBITTORRENT_USER, QBITTORRENT_PASS]):
+        raise SystemExit("Missing qBittorrent env vars.")
+
     global TORRENT_HASH_BUDGET
     log(f"{VERSION} — url={QBITTORRENT_URL} — MIN_SIZE_MB={MIN_SIZE_MB} — EXT_WHITELIST={','.join(EXT_WHITELIST)} "
         f"— ACTIVE_GRACE_MINUTES={ACTIVE_GRACE_MINUTES} — MIN_COMPLETED_AGE_HOURS={MIN_COMPLETED_AGE_HOURS} "
