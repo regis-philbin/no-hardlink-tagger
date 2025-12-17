@@ -128,9 +128,9 @@ services:
 ```
 
 ### UI overview
-- **Status header:** displays the last verification timestamp (global), total torrent count, how many still exist in qBittorrent, and how many were ever removed. A **Refresh existence now** button triggers an immediate verification pass.
-- **Table:** sortable/searchable DataTable with filters for existence, removed state, removed-after-tag state, and linked-percent min/max ranges. Columns include torrent name/hash/tracker/tags, linked percentage, cached flag (whether a cached assessment was reused), existence/removal flags, coverage tag, and last action metadata.
+- **Status header:** displays the last verification timestamp (global), total torrent count, how many still exist in qBittorrent, and how many are currently **missing**. A **Refresh existence now** button triggers an immediate verification pass.
+- **Table:** sortable/searchable DataTable with filters for existence, current missing state, missing-after-tag state, and linked-percent min/max ranges. Columns include torrent name/hash/tracker/tags, linked percentage, cached flag (whether a cached assessment was reused), existence/missing flags, coverage tag, and last action metadata.
 
-### Removed vs. removed after tag
-- **Removed?** is set once a previously assessed torrent is no longer returned by qBittorrent.
-- **Removed after tag?** is set when a removal is detected after this script successfully applied a tag (e.g., `ORPHAN_TAG`) to the torrent, regardless of what later removed it.
+### Missing vs. missing after tag
+- **Missing?** reflects the current state: `exists_in_qbt == 0` at the time of the latest verification check.
+- **Missing after tag?** is true when the torrent is currently missing and the most recent tag action from this script succeeded (optionally also requiring that tag action to predate the first missing observation).

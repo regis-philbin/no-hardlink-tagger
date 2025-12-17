@@ -307,6 +307,9 @@ class AssessmentDB:
         except Exception as e:
             log(f"⚠️ Failed to initialize database at {path}: {e}")
 
+    def _warn(self, msg):
+        log(f"⚠️ DB: {msg}")
+
     def _connect(self):
         conn = sqlite3.connect(self.path, check_same_thread=False, timeout=30)
         conn.row_factory = sqlite3.Row
@@ -378,15 +381,18 @@ class AssessmentDB:
     def _execute(self, query, params=None, many=False):
         if not self.ready:
             return
-        conn = self._connect()
         try:
-            with conn:
-                if many:
-                    conn.executemany(query, params or [])
-                else:
-                    conn.execute(query, params or [])
-        finally:
-            conn.close()
+            conn = self._connect()
+            try:
+                with conn:
+                    if many:
+                        conn.executemany(query, params or [])
+                    else:
+                        conn.execute(query, params or [])
+            finally:
+                conn.close()
+        except Exception as e:
+            self._warn(e)
 
     def upsert_torrents(self, rows):
         if not (self.ready and rows):
@@ -474,49 +480,60 @@ class AssessmentDB:
     def get_meta(self, key):
         if not self.ready:
             return None
-        conn = self._connect()
         try:
-            cur = conn.execute("SELECT value FROM meta WHERE key=?;", (key,))
-            row = cur.fetchone()
-            return row['value'] if row else None
-        finally:
-            conn.close()
+            conn = self._connect()
+            try:
+                cur = conn.execute("SELECT value FROM meta WHERE key=?;", (key,))
+                row = cur.fetchone()
+                return row['value'] if row else None
+            finally:
+                conn.close()
+        except Exception as e:
+            self._warn(e)
+            return None
 
     def list_hashes(self):
         if not self.ready:
             return set()
-        conn = self._connect()
         try:
-            cur = conn.execute("SELECT torrent_hash FROM torrents;")
-            return {r['torrent_hash'] for r in cur.fetchall()}
-        finally:
-            conn.close()
+            conn = self._connect()
+            try:
+                cur = conn.execute("SELECT torrent_hash FROM torrents;")
+                return {r['torrent_hash'] for r in cur.fetchall()}
+            finally:
+                conn.close()
+        except Exception as e:
+            self._warn(e)
+            return set()
 
     def update_existence(self, exists_hashes, missing_hashes, ts):
         if not self.ready:
             return
-        conn = self._connect()
         try:
-            with conn:
-                if exists_hashes:
-                    conn.executemany(
-                        "UPDATE torrents SET exists_in_qbt=1, last_seen_in_qbt_at=?, last_missing_in_qbt_at=last_missing_in_qbt_at WHERE torrent_hash=?;",
-                        [(ts, h) for h in exists_hashes],
-                    )
-                if missing_hashes:
-                    conn.executemany(
-                        """
-                        UPDATE torrents
-                        SET exists_in_qbt=0,
-                            last_missing_in_qbt_at=?,
-                            removed=1,
-                            removed_after_tag=CASE WHEN removed_after_tag=1 THEN 1 ELSE (CASE WHEN last_action='tag' AND last_action_success=1 THEN 1 ELSE 0 END) END
-                        WHERE torrent_hash=?;
-                        """,
-                        [(ts, h) for h in missing_hashes],
-                    )
-        finally:
-            conn.close()
+            conn = self._connect()
+            try:
+                with conn:
+                    if exists_hashes:
+                        conn.executemany(
+                            "UPDATE torrents SET exists_in_qbt=1, last_seen_in_qbt_at=?, last_missing_in_qbt_at=last_missing_in_qbt_at WHERE torrent_hash=?;",
+                            [(ts, h) for h in exists_hashes],
+                        )
+                    if missing_hashes:
+                        conn.executemany(
+                            """
+                            UPDATE torrents
+                            SET exists_in_qbt=0,
+                                last_missing_in_qbt_at=?,
+                                removed=1,
+                                removed_after_tag=CASE WHEN removed_after_tag=1 THEN 1 ELSE (CASE WHEN last_action='tag' AND last_action_success=1 THEN 1 ELSE 0 END) END
+                            WHERE torrent_hash=?;
+                            """,
+                            [(ts, h) for h in missing_hashes],
+                        )
+            finally:
+                conn.close()
+        except Exception as e:
+            self._warn(e)
 
     def status(self):
         if not self.ready:
@@ -524,66 +541,94 @@ class AssessmentDB:
                 'last_verified_at': None,
                 'total': 0,
                 'exists': 0,
-                'removed': 0,
+                'missing': 0,
                 'last_verify_error': None,
             }
-        conn = self._connect()
         try:
-            cur = conn.execute("SELECT COUNT(*) AS c FROM torrents;")
-            total = cur.fetchone()['c']
-            cur = conn.execute("SELECT COUNT(*) AS c FROM torrents WHERE exists_in_qbt=1;")
-            exists = cur.fetchone()['c']
-            cur = conn.execute("SELECT COUNT(*) AS c FROM torrents WHERE removed=1;")
-            removed = cur.fetchone()['c']
+            conn = self._connect()
+            try:
+                cur = conn.execute("SELECT COUNT(*) AS c FROM torrents;")
+                total = cur.fetchone()['c']
+                cur = conn.execute("SELECT COUNT(*) AS c FROM torrents WHERE exists_in_qbt=1;")
+                exists = cur.fetchone()['c']
+                cur = conn.execute("SELECT COUNT(*) AS c FROM torrents WHERE exists_in_qbt=0;")
+                missing = cur.fetchone()['c']
+                return {
+                    'last_verified_at': self.get_meta('last_verified_at'),
+                    'total': total,
+                    'exists': exists,
+                    'missing': missing,
+                    'last_verify_error': self.get_meta('last_verify_error'),
+                }
+            finally:
+                conn.close()
+        except Exception as e:
+            self._warn(e)
             return {
                 'last_verified_at': self.get_meta('last_verified_at'),
-                'total': total,
-                'exists': exists,
-                'removed': removed,
+                'total': 0,
+                'exists': 0,
+                'missing': 0,
                 'last_verify_error': self.get_meta('last_verify_error'),
             }
-        finally:
-            conn.close()
 
     def fetch_assessments(self):
         if not self.ready:
             return []
-        conn = self._connect()
         try:
-            cur = conn.execute("""
-                SELECT torrent_hash, name, size_bytes, tracker, tags, last_assessed_at, linked_pct,
-                       coverage_tag, cached, exists_in_qbt, removed, removed_after_tag,
-                       last_action, last_action_tag, last_action_at, last_action_success,
-                       last_action_error
-                FROM torrents
-                ORDER BY (last_assessed_at IS NULL), last_assessed_at DESC;
-            """)
-            rows = cur.fetchall()
-            results = []
-            for r in rows:
-                results.append({
-                    'torrent_hash': r['torrent_hash'],
-                    'name': r['name'],
-                    'size_bytes': r['size_bytes'],
-                    'size_human': human_size(r['size_bytes']),
-                    'tracker': r['tracker'],
-                    'tags': r['tags'],
-                    'last_assessed_at': r['last_assessed_at'],
-                    'linked_pct': r['linked_pct'],
-                    'cached': bool(r['cached']) if r['cached'] is not None else False,
-                    'exists_in_qbt': bool(r['exists_in_qbt']) if r['exists_in_qbt'] is not None else False,
-                    'removed': bool(r['removed']) if r['removed'] is not None else False,
-                    'removed_after_tag': bool(r['removed_after_tag']) if r['removed_after_tag'] is not None else False,
-                    'coverage_tag': r['coverage_tag'],
-                    'last_action': r['last_action'],
-                    'last_action_tag': r['last_action_tag'],
-                    'last_action_at': r['last_action_at'],
-                    'last_action_success': r['last_action_success'],
-                    'last_action_error': r['last_action_error'],
-                })
-            return results
-        finally:
-            conn.close()
+            conn = self._connect()
+            try:
+                cur = conn.execute("""
+                    SELECT torrent_hash, name, size_bytes, tracker, tags, last_assessed_at, linked_pct,
+                           coverage_tag, cached, exists_in_qbt, removed, removed_after_tag,
+                           last_seen_in_qbt_at, last_missing_in_qbt_at,
+                           last_action, last_action_tag, last_action_at, last_action_success,
+                           last_action_error
+                    FROM torrents
+                    ORDER BY (last_assessed_at IS NULL), last_assessed_at DESC;
+                """)
+                rows = cur.fetchall()
+                results = []
+                for r in rows:
+                    missing = not bool(r['exists_in_qbt']) if r['exists_in_qbt'] is not None else False
+                    missing_after_tag = False
+                    if missing and r['last_action'] == 'tag' and (r['last_action_success'] == 1 or r['last_action_success'] is True):
+                        if r['last_missing_in_qbt_at'] and r['last_action_at']:
+                            try:
+                                missing_after_tag = r['last_action_at'] < r['last_missing_in_qbt_at']
+                            except Exception:
+                                missing_after_tag = True
+                        else:
+                            missing_after_tag = True
+                    results.append({
+                        'torrent_hash': r['torrent_hash'],
+                        'name': r['name'],
+                        'size_bytes': r['size_bytes'],
+                        'size_human': human_size(r['size_bytes']),
+                        'tracker': r['tracker'],
+                        'tags': r['tags'],
+                        'last_assessed_at': r['last_assessed_at'],
+                        'linked_pct': r['linked_pct'],
+                        'cached': bool(r['cached']) if r['cached'] is not None else False,
+                        'exists_in_qbt': bool(r['exists_in_qbt']) if r['exists_in_qbt'] is not None else False,
+                        'missing': missing,
+                        'missing_after_tag': missing_after_tag,
+                        'removed': bool(r['removed']) if r['removed'] is not None else False,
+                        'removed_after_tag': bool(r['removed_after_tag']) if r['removed_after_tag'] is not None else False,
+                        'last_missing_in_qbt_at': r['last_missing_in_qbt_at'],
+                        'coverage_tag': r['coverage_tag'],
+                        'last_action': r['last_action'],
+                        'last_action_tag': r['last_action_tag'],
+                        'last_action_at': r['last_action_at'],
+                        'last_action_success': r['last_action_success'],
+                        'last_action_error': r['last_action_error'],
+                    })
+                return results
+            finally:
+                conn.close()
+        except Exception as e:
+            self._warn(e)
+            return []
 
 
 # =========================
@@ -597,7 +642,7 @@ class VerificationScheduler:
 
     def verify_now(self):
         if not (self.db and self.db.ready):
-            return {'last_verified_at': None, 'total': 0, 'exists': 0, 'removed': 0, 'last_verify_error': 'db_unavailable'}
+            return {'last_verified_at': None, 'total': 0, 'exists': 0, 'missing': 0, 'last_verify_error': 'db_unavailable'}
         if not self.lock.acquire(blocking=False):
             return self.db.status()
         start = time.time()
@@ -671,7 +716,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
   <h1>No-hardlink-tagger assessments</h1>
   <div class=\"status\">
     <div><strong>Last verified at:</strong> <span id=\"last-verified\">never</span> <span id=\"verify-error\" class=\"error\"></span></div>
-    <div><span id=\"count-total\">0</span> total &middot; <span id=\"count-exists\">0</span> exist &middot; <span id=\"count-removed\">0</span> removed</div>
+    <div><span id=\"count-total\">0</span> total &middot; <span id=\"count-exists\">0</span> exist &middot; <span id=\"count-missing\">0</span> missing</div>
     <div style=\"margin-top:8px;\"><button id=\"refresh-btn\" class=\"btn\">Refresh existence now</button></div>
   </div>
 
@@ -683,15 +728,15 @@ WEB_UI_HTML = """<!DOCTYPE html>
         <option value=\"missing\">Missing</option>
       </select>
     </label>
-    <label>Removed
-      <select id=\"filter-removed\">
+    <label>Missing
+      <select id=\"filter-missing\">
         <option value=\"all\">All</option>
         <option value=\"yes\">Yes</option>
         <option value=\"no\">No</option>
       </select>
     </label>
-    <label>Removed after tag
-      <select id=\"filter-removed-after\">
+    <label>Missing after tag
+      <select id=\"filter-missing-after\">
         <option value=\"all\">All</option>
         <option value=\"yes\">Yes</option>
         <option value=\"no\">No</option>
@@ -717,8 +762,8 @@ WEB_UI_HTML = """<!DOCTYPE html>
         <th>% linked</th>
         <th>Cached?</th>
         <th>Exists?</th>
-        <th>Removed?</th>
-        <th>Removed after tag?</th>
+        <th>Missing?</th>
+        <th>Missing after tag?</th>
         <th>Coverage tag</th>
         <th>Last action</th>
         <th>Last action tag</th>
@@ -744,7 +789,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
         document.getElementById('last-verified').innerText = data.last_verified_at || 'never';
         document.getElementById('count-total').innerText = data.total;
         document.getElementById('count-exists').innerText = data.exists;
-        document.getElementById('count-removed').innerText = data.removed;
+        document.getElementById('count-missing').innerText = data.missing;
         document.getElementById('verify-error').innerText = data.last_verify_error || '';
       } catch (e) {
         document.getElementById('verify-error').innerText = 'Failed to load status';
@@ -767,13 +812,13 @@ WEB_UI_HTML = """<!DOCTYPE html>
         if (existsFilter === 'exists' && !row.exists_in_qbt) return false;
         if (existsFilter === 'missing' && row.exists_in_qbt) return false;
 
-        const removedFilter = document.getElementById('filter-removed').value;
-        if (removedFilter === 'yes' && !row.removed) return false;
-        if (removedFilter === 'no' && row.removed) return false;
+        const missingFilter = document.getElementById('filter-missing').value;
+        if (missingFilter === 'yes' && !row.missing) return false;
+        if (missingFilter === 'no' && row.missing) return false;
 
-        const removedAfterFilter = document.getElementById('filter-removed-after').value;
-        if (removedAfterFilter === 'yes' && !row.removed_after_tag) return false;
-        if (removedAfterFilter === 'no' && row.removed_after_tag) return false;
+        const missingAfterFilter = document.getElementById('filter-missing-after').value;
+        if (missingAfterFilter === 'yes' && !row.missing_after_tag) return false;
+        if (missingAfterFilter === 'no' && row.missing_after_tag) return false;
 
         const minPct = parseFloat(document.getElementById('filter-linked-min').value);
         const maxPct = parseFloat(document.getElementById('filter-linked-max').value);
@@ -786,7 +831,7 @@ WEB_UI_HTML = """<!DOCTYPE html>
         return true;
       });
 
-      ['filter-exists', 'filter-removed', 'filter-removed-after', 'filter-linked-min', 'filter-linked-max'].forEach(id => {
+      ['filter-exists', 'filter-missing', 'filter-missing-after', 'filter-linked-min', 'filter-linked-max'].forEach(id => {
         const el = document.getElementById(id);
         el.addEventListener('change', () => table.draw());
         el.addEventListener('keyup', () => table.draw());
@@ -806,8 +851,8 @@ WEB_UI_HTML = """<!DOCTYPE html>
           { data: 'linked_pct', render: function(data) { return fmtPct(data); }, defaultContent: '' },
           { data: 'cached', render: function(data) { return fmtBool(data); }, defaultContent: '' },
           { data: 'exists_in_qbt', render: function(data) { return fmtBool(data); }, defaultContent: '' },
-          { data: 'removed', render: function(data) { return fmtBool(data); }, defaultContent: '' },
-          { data: 'removed_after_tag', render: function(data) { return fmtBool(data); }, defaultContent: '' },
+          { data: 'missing', render: function(data) { return fmtBool(data); }, defaultContent: '' },
+          { data: 'missing_after_tag', render: function(data) { return fmtBool(data); }, defaultContent: '' },
           { data: 'coverage_tag', defaultContent: '' },
           { data: 'last_action', defaultContent: '' },
           { data: 'last_action_tag', defaultContent: '' },
@@ -870,7 +915,7 @@ class WebUIHandler(BaseHTTPRequestHandler):
                 'last_verified_at': None,
                 'total': 0,
                 'exists': 0,
-                'removed': 0,
+                'missing': 0,
                 'last_verify_error': None,
             }
             if status_obj.get('last_verify_error') == '':
