@@ -22,6 +22,7 @@ services:
       DOWNLOADS_DIR: "${DOWNLOADS_DIR:-/media/downloads}"
       MEDIA_DIRS: "${MEDIA_DIRS:-/media/movies,/media/tv}"
       DEBUG_INTERVAL: "${DEBUG_INTERVAL:-60}"
+      LOG_USE_AMPM: "${LOG_USE_AMPM:-0}"
       BATCH_SIZE: "${BATCH_SIZE:-25}"
       MAX_TORRENTS: "${MAX_TORRENTS:-0}"
       MIN_SIZE_MB: "${MIN_SIZE_MB:-50}"
@@ -68,6 +69,7 @@ All runtime configuration is provided through environment variables and can be e
 | `DOWNLOADS_DIR` | `/media/downloads` | Root downloads directory in qBittorrent. |
 | `MEDIA_DIRS` | `/media/movies,/media/tv` | Comma-separated media library directories to check for hardlinks. |
 | `DEBUG_INTERVAL` | `60` | Seconds between cleanup cycles (log heartbeat). |
+| `LOG_USE_AMPM` | `0` | Set to `1` to format log timestamps in 12-hour time with AM/PM. |
 | `BATCH_SIZE` | `25` | Torrents scanned per batch. |
 | `MAX_TORRENTS` | `0` | Maximum torrents to process per run (`0` = no limit). |
 | `MIN_SIZE_MB` | `50` | Minimum file size (MiB) to treat as media. |
